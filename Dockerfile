@@ -22,9 +22,12 @@ LABEL maintainer="AmaliTech Training Academy" \
     description="Cloud Insight Pro Project" \
     version="1.0"
 
+# Install jq for JSON processing
+RUN apt-get update && apt-get install -y jq && apt-get clean
+
 # Set default environment variables (can be overridden)
 ENV SPRING_PROFILES_ACTIVE=production
-ENV SERVER_PORT=8080
+ENV SERVER_PORT=8761
 
 # Create a non-root user
 RUN useradd -r -u 1001 -g root userservice
@@ -34,9 +37,13 @@ WORKDIR /application
 # Copy the extracted layers from the build stage
 COPY --from=builder --chown=userservice:root /build/target/*.jar ./application.jar
 
+# Copy the entrypoint script
+COPY --chown=userservice:root entrypoint.sh ./entrypoint.sh
+RUN chmod +x /application/entrypoint.sh
+
 # Configure container
 USER 1001
-EXPOSE 8080
+EXPOSE 8761
 
-# Use the standard JAR execution
-ENTRYPOINT ["java", "-XX:+UseContainerSupport", "-XX:MaxRAMPercentage=75.0", "-Djava.security.egd=file:/dev/./urandom", "-jar", "application.jar"]
+# Use entrypoint script before launching the application
+ENTRYPOINT ["/bin/bash", "-c", "source ./entrypoint.sh && java -XX:+UseContainerSupport -XX:MaxRAMPercentage=75.0 -Djava.security.egd=file:/dev/./urandom -jar application.jar"]
