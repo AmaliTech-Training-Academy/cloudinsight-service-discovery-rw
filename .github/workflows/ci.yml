@@ -114,28 +114,17 @@ jobs:
           clean_value() {
             local raw_value="$1"
             
-            # Remove carriage returns, newlines, tabs, and other control characters
-            local cleaned_value=$(echo "$raw_value" | tr -d '\r\n\t' | sed 's/[[:cntrl:]]//g')
+            # More aggressive cleaning - remove ALL control characters including null bytes
+            local cleaned_value=$(printf '%s' "$raw_value" | tr -d '\000-\037\177' | tr -d '\r\n\t')
             
-            # Trim leading and trailing whitespace
-            cleaned_value=$(echo "$cleaned_value" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            # Additional cleaning with sed for any remaining control chars
+            cleaned_value=$(echo "$cleaned_value" | sed 's/[[:cntrl:]]//g' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
             
-            # Check if value is a pure integer (no decimals)
-            if [[ "$cleaned_value" =~ ^-?[0-9]+$ ]]; then
-              # Return as integer (remove quotes in JSON)
-              echo "$cleaned_value"
-            # Check if value is a decimal number
-            elif [[ "$cleaned_value" =~ ^-?[0-9]+\.[0-9]+$ ]]; then
-              # Return as number (remove quotes in JSON)
-              echo "$cleaned_value"
-            # Check if value is a boolean
-            elif [[ "$cleaned_value" =~ ^(true|false)$ ]]; then
-              # Return as boolean (remove quotes in JSON)
-              echo "$cleaned_value"
-            else
-              # Return as string (keep quotes in JSON)
-              echo "\"$cleaned_value\""
-            fi
+            # Debug output
+            echo "  🔍 Raw value length: ${#raw_value}, Cleaned length: ${#cleaned_value}" >&2
+            
+            # Always return as string to avoid jq parsing issues
+            echo "$cleaned_value"
           }
 
           # Create JSON using jq to properly escape all characters
@@ -150,20 +139,13 @@ jobs:
             value=$(echo "$value" | sed 's/[[:space:]]*#.*$//')
             
             if [[ -n "$key" && -n "$value" ]]; then
-              # Clean the value and determine its type
+              # Clean the value 
               cleaned_value=$(clean_value "$value")
               
-              # Check if cleaned_value is already properly formatted (number/boolean)
-              if [[ "$cleaned_value" =~ ^-?[0-9]+(\.[0-9]+)?$|^(true|false)$ ]]; then
-                # Add as raw value (number or boolean)
-                jq --arg k "$key" --argjson v "$cleaned_value" '. + {($k): $v}' /tmp/new.json > /tmp/temp.json && mv /tmp/temp.json /tmp/new.json
-              else
-                # Remove quotes and add as string value
-                string_value=$(echo "$cleaned_value" | sed 's/^"//;s/"$//')
-                jq --arg k "$key" --arg v "$string_value" '. + {($k): $v}' /tmp/new.json > /tmp/temp.json && mv /tmp/temp.json /tmp/new.json
-              fi
+              # Always use string values to avoid jq parsing issues
+              jq --arg k "$key" --arg v "$cleaned_value" '. + {($k): $v}' /tmp/new.json > /tmp/temp.json && mv /tmp/temp.json /tmp/new.json
               
-              echo "  🔑 Processed $key: $cleaned_value"
+              echo "  🔑 Processed $key: '$cleaned_value'"
             fi
           done < .env
 
@@ -183,18 +165,11 @@ jobs:
               if [[ -n "$key" && -n "$value" ]]; then
                 echo "  🔑 Processing key: $key"
                 
-                # Clean the value and determine its type
+                # Clean the value - always use as string to avoid jq issues
                 cleaned_value=$(clean_value "$value")
                 
-                # Check if cleaned_value is already properly formatted (number/boolean)
-                if [[ "$cleaned_value" =~ ^-?[0-9]+(\.[0-9]+)?$|^(true|false)$ ]]; then
-                  # Add as raw value (number or boolean)
-                  jq --arg k "$key" --argjson v "$cleaned_value" '. + {($k): $v}' /tmp/new_vars.json > /tmp/temp_vars.json && mv /tmp/temp_vars.json /tmp/new_vars.json
-                else
-                  # Remove quotes and add as string value
-                  string_value=$(echo "$cleaned_value" | sed 's/^"//;s/"$//')
-                  jq --arg k "$key" --arg v "$string_value" '. + {($k): $v}' /tmp/new_vars.json > /tmp/temp_vars.json && mv /tmp/temp_vars.json /tmp/new_vars.json
-                fi
+                # Always use string values to avoid jq parsing issues
+                jq --arg k "$key" --arg v "$cleaned_value" '. + {($k): $v}' /tmp/new_vars.json > /tmp/temp_vars.json && mv /tmp/temp_vars.json /tmp/new_vars.json
               fi
             done < .env
             
@@ -218,18 +193,11 @@ jobs:
               if [[ -n "$key" && -n "$value" ]]; then
                 echo "  🔑 Adding key: $key"
                 
-                # Clean the value and determine its type
+                # Clean the value - always use as string to avoid jq issues  
                 cleaned_value=$(clean_value "$value")
                 
-                # Check if cleaned_value is already properly formatted (number/boolean)
-                if [[ "$cleaned_value" =~ ^-?[0-9]+(\.[0-9]+)?$|^(true|false)$ ]]; then
-                  # Add as raw value (number or boolean)
-                  jq --arg k "$key" --argjson v "$cleaned_value" '. + {($k): $v}' /tmp/new.json > /tmp/temp_new.json && mv /tmp/temp_new.json /tmp/new.json
-                else
-                  # Remove quotes and add as string value
-                  string_value=$(echo "$cleaned_value" | sed 's/^"//;s/"$//')
-                  jq --arg k "$key" --arg v "$string_value" '. + {($k): $v}' /tmp/new.json > /tmp/temp_new.json && mv /tmp/temp_new.json /tmp/new.json
-                fi
+                # Always use string values to avoid jq parsing issues
+                jq --arg k "$key" --arg v "$cleaned_value" '. + {($k): $v}' /tmp/new.json > /tmp/temp_new.json && mv /tmp/temp_new.json /tmp/new.json
               fi
             done < .env
             
