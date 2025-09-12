@@ -107,26 +107,142 @@ jobs:
           echo "🚫 Removing database secrets (DB_PASSWORD, DB_URL, DB_USERNAME) from environment variables..."
           sed -i '/^DB_PASSWORD=/d; /^DB_URL=/d; /^DB_USERNAME=/d' .env
 
-          # Convert .env to JSON
-          echo "{" > /tmp/new.json
+          echo "📊 Remaining environment variables after database secret exclusion:"
+          grep -c "^[^#].*=" .env || echo "0"
+
+          # Function to clean and process values
+          clean_value() {
+            local raw_value="$1"
+            
+            # Remove carriage returns, newlines, tabs, and other control characters
+            local cleaned_value=$(echo "$raw_value" | tr -d '\r\n\t' | sed 's/[[:cntrl:]]//g')
+            
+            # Trim leading and trailing whitespace
+            cleaned_value=$(echo "$cleaned_value" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            
+            # Check if value is a pure integer (no decimals)
+            if [[ "$cleaned_value" =~ ^-?[0-9]+$ ]]; then
+              # Return as integer (remove quotes in JSON)
+              echo "$cleaned_value"
+            # Check if value is a decimal number
+            elif [[ "$cleaned_value" =~ ^-?[0-9]+\.[0-9]+$ ]]; then
+              # Return as number (remove quotes in JSON)
+              echo "$cleaned_value"
+            # Check if value is a boolean
+            elif [[ "$cleaned_value" =~ ^(true|false)$ ]]; then
+              # Return as boolean (remove quotes in JSON)
+              echo "$cleaned_value"
+            else
+              # Return as string (keep quotes in JSON)
+              echo "\"$cleaned_value\""
+            fi
+          }
+
+          # Create JSON using jq to properly escape all characters
+          echo "{}" > /tmp/new.json
           while IFS='=' read -r key value || [ -n "$key" ]; do
-            if [[ -z "$key" || "$key" =~ ^[[:space:]]*# ]]; then continue; fi
+            # Skip empty lines and comment lines
+            if [[ -z "$key" || "$key" =~ ^[[:space:]]*# ]]; then
+              continue
+            fi
+            
+            # Remove inline comments from value (everything after # including the #)
             value=$(echo "$value" | sed 's/[[:space:]]*#.*$//')
+            
             if [[ -n "$key" && -n "$value" ]]; then
-              escaped_value=$(echo "$value" | sed 's/"/\\"/g')
-              echo "  \"$key\": \"$escaped_value\"," >> /tmp/new.json
+              # Clean the value and determine its type
+              cleaned_value=$(clean_value "$value")
+              
+              # Check if cleaned_value is already properly formatted (number/boolean)
+              if [[ "$cleaned_value" =~ ^-?[0-9]+(\.[0-9]+)?$|^(true|false)$ ]]; then
+                # Add as raw value (number or boolean)
+                jq --arg k "$key" --argjson v "$cleaned_value" '. + {($k): $v}' /tmp/new.json > /tmp/temp.json && mv /tmp/temp.json /tmp/new.json
+              else
+                # Remove quotes and add as string value
+                string_value=$(echo "$cleaned_value" | sed 's/^"//;s/"$//')
+                jq --arg k "$key" --arg v "$string_value" '. + {($k): $v}' /tmp/new.json > /tmp/temp.json && mv /tmp/temp.json /tmp/new.json
+              fi
+              
+              echo "  🔑 Processed $key: $cleaned_value"
             fi
           done < .env
-          sed -i '$ s/,$//' /tmp/new.json
-          echo "}" >> /tmp/new.json
 
-          # Update or create secret
+          # Check if secret exists and deploy as key-value pairs
           if aws secretsmanager describe-secret --secret-id "$SECRET_NAME" >/dev/null 2>&1; then
-            aws secretsmanager update-secret --secret-id "$SECRET_NAME" --secret-string file:///tmp/new.json
+            echo "✅ Secret exists, updating individual key-value pairs..."
+            
+            # Get existing secret and merge with new values
+            EXISTING_SECRET=$(aws secretsmanager get-secret-value --secret-id "$SECRET_NAME" --query SecretString --output text)
+            echo "$EXISTING_SECRET" > /tmp/existing.json
+            
+            # Create new values JSON with cleaned values
+            echo "{}" > /tmp/new_vars.json
+            while IFS='=' read -r key value || [ -n "$key" ]; do
+              if [[ -z "$key" || "$key" =~ ^[[:space:]]*# ]]; then continue; fi
+              value=$(echo "$value" | sed 's/[[:space:]]*#.*$//')
+              if [[ -n "$key" && -n "$value" ]]; then
+                echo "  🔑 Processing key: $key"
+                
+                # Clean the value and determine its type
+                cleaned_value=$(clean_value "$value")
+                
+                # Check if cleaned_value is already properly formatted (number/boolean)
+                if [[ "$cleaned_value" =~ ^-?[0-9]+(\.[0-9]+)?$|^(true|false)$ ]]; then
+                  # Add as raw value (number or boolean)
+                  jq --arg k "$key" --argjson v "$cleaned_value" '. + {($k): $v}' /tmp/new_vars.json > /tmp/temp_vars.json && mv /tmp/temp_vars.json /tmp/new_vars.json
+                else
+                  # Remove quotes and add as string value
+                  string_value=$(echo "$cleaned_value" | sed 's/^"//;s/"$//')
+                  jq --arg k "$key" --arg v "$string_value" '. + {($k): $v}' /tmp/new_vars.json > /tmp/temp_vars.json && mv /tmp/temp_vars.json /tmp/new_vars.json
+                fi
+              fi
+            done < .env
+            
+            # Merge existing with new values
+            jq -s '.[0] * .[1]' /tmp/existing.json /tmp/new_vars.json > /tmp/merged.json
+            
+            # Update secret
+            aws secretsmanager update-secret --secret-id "$SECRET_NAME" --secret-string file:///tmp/merged.json
+            echo "✅ Secret updated successfully with merged key-value pairs"
+            
+            # Cleanup merge files
+            rm -f /tmp/existing.json /tmp/new_vars.json /tmp/merged.json
           else
+            echo "🆕 Creating new secret with key-value pairs..."
+            
+            # Create JSON with all key-value pairs using cleaned values
+            echo "{}" > /tmp/new.json
+            while IFS='=' read -r key value || [ -n "$key" ]; do
+              if [[ -z "$key" || "$key" =~ ^[[:space:]]*# ]]; then continue; fi
+              value=$(echo "$value" | sed 's/[[:space:]]*#.*$//')
+              if [[ -n "$key" && -n "$value" ]]; then
+                echo "  🔑 Adding key: $key"
+                
+                # Clean the value and determine its type
+                cleaned_value=$(clean_value "$value")
+                
+                # Check if cleaned_value is already properly formatted (number/boolean)
+                if [[ "$cleaned_value" =~ ^-?[0-9]+(\.[0-9]+)?$|^(true|false)$ ]]; then
+                  # Add as raw value (number or boolean)
+                  jq --arg k "$key" --argjson v "$cleaned_value" '. + {($k): $v}' /tmp/new.json > /tmp/temp_new.json && mv /tmp/temp_new.json /tmp/new.json
+                else
+                  # Remove quotes and add as string value
+                  string_value=$(echo "$cleaned_value" | sed 's/^"//;s/"$//')
+                  jq --arg k "$key" --arg v "$string_value" '. + {($k): $v}' /tmp/new.json > /tmp/temp_new.json && mv /tmp/temp_new.json /tmp/new.json
+                fi
+              fi
+            done < .env
+            
+            # Create new secret
             aws secretsmanager create-secret --name "$SECRET_NAME" --description "Backend environment variables for ${{ github.repository }}" --secret-string file:///tmp/new.json
+            echo "✅ Secret created successfully with all key-value pairs"
+            
+            # Cleanup
+            rm -f /tmp/new.json
           fi
-          rm -f /tmp/new.json
+
+          echo "🔐 Environment variables deployed to AWS Secrets Manager: $SECRET_NAME"
+          echo "🚫 Database secrets (DB_PASSWORD, DB_URL, DB_USERNAME) excluded from deployment"
 
       - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
