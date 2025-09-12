@@ -110,62 +110,36 @@ jobs:
           echo "📊 Remaining environment variables after database secret exclusion:"
           grep -c "^[^#].*=" .env || echo "0"
 
-          # Simple function to build JSON from env file
-          clean_and_build_json() {
-            local env_file="$1"
-            local output_file="$2"
+          # Create JSON using jq to properly escape all characters
+          echo "{}" > /tmp/new.json
+          while IFS='=' read -r key value || [ -n "$key" ]; do
+            # Skip empty lines and comment lines
+            if [[ -z "$key" || "$key" =~ ^[[:space:]]*# ]]; then
+              continue
+            fi
             
-            # Use a single Python command to build clean JSON
-            python3 -c "import json,re; data={}; [data.update({line.split('=',1)[0].strip(): re.sub(r'[\x00-\x1f\x7f]','',line.split('=',1)[1].split('#')[0].strip())}) for line in open('$env_file') if '=' in line and not line.strip().startswith('#') and line.strip()]; json.dump(data, open('$output_file','w'), ensure_ascii=False, separators=(',',':'))"
+            # Remove inline comments from value (everything after # including the #)
+            value=$(echo "$value" | sed 's/[[:space:]]*#.*$//')
             
-            # Log what was processed
-            echo "� Built JSON with $(python3 -c "import json; print(len(json.load(open('$output_file'))))" 2>/dev/null || echo "0") environment variables"
-          }
+            if [[ -n "$key" && -n "$value" ]]; then
+              # Use jq to properly escape the value and add to JSON
+              jq --arg k "$key" --arg v "$value" '. + {($k): $v}' /tmp/new.json > /tmp/temp.json && mv /tmp/temp.json /tmp/new.json
+            fi
+          done < .env
 
-          # Create JSON using the robust cleaning function
-          clean_and_build_json ".env" "/tmp/new.json"
-
-          # Check if secret exists and deploy as key-value pairs (Other type of secret)
+          # Update or create secret
           if aws secretsmanager describe-secret --secret-id "$SECRET_NAME" >/dev/null 2>&1; then
-            echo "✅ Secret exists, updating with key-value pairs..."
-            
-            # Get existing secret and clean it
-            EXISTING_SECRET=$(aws secretsmanager get-secret-value --secret-id "$SECRET_NAME" --query SecretString --output text)
-            echo "$EXISTING_SECRET" > /tmp/existing_raw.json
-            
-            # Create new values JSON using the robust function
-            clean_and_build_json ".env" "/tmp/new_vars.json"
-            
-            # Clean and merge using single-line Python
-            python3 -c "import json,re; existing={}; exec('try:\n with open(\"/tmp/existing_raw.json\") as f: content=f.read()\n clean_content=re.sub(r\"[\x00-\x1f\x7f]\",\"\",content)\n existing=json.loads(clean_content)\nexcept: existing={}'); new=json.load(open('/tmp/new_vars.json')); existing.update(new); json.dump(existing,open('/tmp/merged.json','w'),ensure_ascii=False,separators=(',',':'))"
-            
-            # Update secret with merged JSON as key-value pairs
-            aws secretsmanager update-secret \
-              --secret-id "$SECRET_NAME" \
-              --secret-string "$(cat /tmp/merged.json)"
-            
-            echo "✅ Secret updated successfully with merged key-value pairs"
-            
-            # Cleanup
-            rm -f /tmp/existing_raw.json /tmp/new_vars.json /tmp/merged.json
+            echo "✅ Secret exists, updating..."
+            aws secretsmanager update-secret --secret-id "$SECRET_NAME" --secret-string file:///tmp/new.json
+            echo "✅ Secret updated successfully"
           else
-            echo "🆕 Creating new secret with key-value pairs..."
-            
-            # Create JSON with all key-value pairs using the robust function
-            clean_and_build_json ".env" "/tmp/new.json"
-            
-            # Create new "Other type of secret" with key-value pairs in JSON format
-            aws secretsmanager create-secret \
-              --name "$SECRET_NAME" \
-              --description "Backend environment variables for ${{ github.repository }} (Other type - Key/Value pairs)" \
-              --secret-string "$(cat /tmp/new.json)"
-            
-            echo "✅ Secret created successfully as 'Other type' with all key-value pairs"
-            
-            # Cleanup
-            rm -f /tmp/new.json
+            echo "🆕 Creating new secret..."
+            aws secretsmanager create-secret --name "$SECRET_NAME" --description "Backend environment variables for ${{ github.repository }}" --secret-string file:///tmp/new.json
+            echo "✅ Secret created successfully"
           fi
 
+          # Cleanup
+          rm -f /tmp/new.json
           echo "🔐 Environment variables deployed to AWS Secrets Manager: $SECRET_NAME"
           echo "🚫 Database secrets (DB_PASSWORD, DB_URL, DB_USERNAME) excluded from deployment"
 
