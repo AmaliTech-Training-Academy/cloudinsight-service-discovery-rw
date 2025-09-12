@@ -110,33 +110,16 @@ jobs:
           echo "📊 Remaining environment variables after database secret exclusion:"
           grep -c "^[^#].*=" .env || echo "0"
 
-          # Function to clean and process values - completely avoid jq parsing issues
+          # Simple function to build JSON from env file
           clean_and_build_json() {
             local env_file="$1"
             local output_file="$2"
             
-            # Start with empty JSON object
-            echo '{}' > "$output_file"
+            # Use a single Python command to build clean JSON
+            python3 -c "import json,re; data={}; [data.update({line.split('=',1)[0].strip(): re.sub(r'[\x00-\x1f\x7f]','',line.split('=',1)[1].split('#')[0].strip())}) for line in open('$env_file') if '=' in line and not line.strip().startswith('#') and line.strip()]; json.dump(data, open('$output_file','w'), ensure_ascii=False, separators=(',',':'))"
             
-            while IFS='=' read -r key value || [ -n "$key" ]; do
-              # Skip empty lines and comment lines
-              if [[ -z "$key" || "$key" =~ ^[[:space:]]*# ]]; then
-                continue
-              fi
-              
-              # Remove inline comments from value
-              value=$(echo "$value" | sed 's/[[:space:]]*#.*$//')
-              
-              if [[ -n "$key" && -n "$value" ]]; then
-                # Ultra-aggressive cleaning - remove ALL problematic characters
-                cleaned_value=$(printf '%s' "$value" | tr -d '\000-\037\177' | tr -d '\r\n\t' | sed 's/[[:cntrl:]]//g' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                
-                echo "  🔑 Processing $key: '$cleaned_value'" >&2
-                
-                # Use Python to safely build JSON to avoid all jq issues
-                python3 -c "import json; data=json.load(open('$output_file')) if open('$output_file').read().strip() else {}; data['$key']='$cleaned_value'; json.dump(data, open('$output_file', 'w'), ensure_ascii=False, separators=(',', ':'))"
-              fi
-            done < "$env_file"
+            # Log what was processed
+            echo "� Built JSON with $(python3 -c "import json; print(len(json.load(open('$output_file'))))" 2>/dev/null || echo "0") environment variables"
           }
 
           # Create JSON using the robust cleaning function
@@ -146,15 +129,15 @@ jobs:
           if aws secretsmanager describe-secret --secret-id "$SECRET_NAME" >/dev/null 2>&1; then
             echo "✅ Secret exists, updating with key-value pairs..."
             
-            # Get existing secret
+            # Get existing secret and clean it
             EXISTING_SECRET=$(aws secretsmanager get-secret-value --secret-id "$SECRET_NAME" --query SecretString --output text)
-            echo "$EXISTING_SECRET" > /tmp/existing.json
+            echo "$EXISTING_SECRET" > /tmp/existing_raw.json
             
             # Create new values JSON using the robust function
             clean_and_build_json ".env" "/tmp/new_vars.json"
             
-            # Merge using Python to avoid all jq issues  
-            python3 -c "import json; existing=json.load(open('/tmp/existing.json')); new_vars=json.load(open('/tmp/new_vars.json')); existing.update(new_vars); json.dump(existing, open('/tmp/merged.json', 'w'), ensure_ascii=False, separators=(',', ':'))"
+            # Clean and merge using single-line Python
+            python3 -c "import json,re; existing={}; exec('try:\n with open(\"/tmp/existing_raw.json\") as f: content=f.read()\n clean_content=re.sub(r\"[\x00-\x1f\x7f]\",\"\",content)\n existing=json.loads(clean_content)\nexcept: existing={}'); new=json.load(open('/tmp/new_vars.json')); existing.update(new); json.dump(existing,open('/tmp/merged.json','w'),ensure_ascii=False,separators=(',',':'))"
             
             # Update secret with merged JSON as key-value pairs
             aws secretsmanager update-secret \
@@ -164,7 +147,7 @@ jobs:
             echo "✅ Secret updated successfully with merged key-value pairs"
             
             # Cleanup
-            rm -f /tmp/existing.json /tmp/new_vars.json /tmp/merged.json
+            rm -f /tmp/existing_raw.json /tmp/new_vars.json /tmp/merged.json
           else
             echo "🆕 Creating new secret with key-value pairs..."
             
