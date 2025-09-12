@@ -134,24 +134,7 @@ jobs:
                 echo "  🔑 Processing $key: '$cleaned_value'" >&2
                 
                 # Use Python to safely build JSON to avoid all jq issues
-                python3 -c "
-import json
-import sys
-
-# Read existing JSON
-try:
-    with open('$output_file', 'r') as f:
-        data = json.load(f)
-except:
-    data = {}
-
-# Add new key-value pair
-data['$key'] = '$cleaned_value'
-
-# Write back
-with open('$output_file', 'w') as f:
-    json.dump(data, f, ensure_ascii=False, separators=(',', ':'))
-"
+                python3 -c "import json; data=json.load(open('$output_file')) if open('$output_file').read().strip() else {}; data['$key']='$cleaned_value'; json.dump(data, open('$output_file', 'w'), ensure_ascii=False, separators=(',', ':'))"
               fi
             done < "$env_file"
           }
@@ -170,23 +153,8 @@ with open('$output_file', 'w') as f:
             # Create new values JSON using the robust function
             clean_and_build_json ".env" "/tmp/new_vars.json"
             
-            # Merge using Python to avoid all jq issues
-            python3 -c "
-import json
-
-# Read existing and new data
-with open('/tmp/existing.json', 'r') as f:
-    existing = json.load(f)
-with open('/tmp/new_vars.json', 'r') as f:
-    new_vars = json.load(f)
-
-# Merge (new values override existing ones)
-existing.update(new_vars)
-
-# Write merged result
-with open('/tmp/merged.json', 'w') as f:
-    json.dump(existing, f, ensure_ascii=False, separators=(',', ':'))
-"
+            # Merge using Python to avoid all jq issues  
+            python3 -c "import json; existing=json.load(open('/tmp/existing.json')); new_vars=json.load(open('/tmp/new_vars.json')); existing.update(new_vars); json.dump(existing, open('/tmp/merged.json', 'w'), ensure_ascii=False, separators=(',', ':'))"
             
             # Update secret with merged JSON as key-value pairs
             aws secretsmanager update-secret \
