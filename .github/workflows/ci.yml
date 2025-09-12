@@ -110,7 +110,7 @@ jobs:
           echo "📊 Remaining environment variables after database secret exclusion:"
           grep -c "^[^#].*=" .env || echo "0"
 
-          # Function to clean and process values
+          # Function to clean and process values - completely avoid jq parsing issues
           clean_and_build_json() {
             local env_file="$1"
             local output_file="$2"
@@ -128,15 +128,30 @@ jobs:
               value=$(echo "$value" | sed 's/[[:space:]]*#.*$//')
               
               if [[ -n "$key" && -n "$value" ]]; then
-                # Aggressive cleaning - remove ALL problematic characters
+                # Ultra-aggressive cleaning - remove ALL problematic characters
                 cleaned_value=$(printf '%s' "$value" | tr -d '\000-\037\177' | tr -d '\r\n\t' | sed 's/[[:cntrl:]]//g' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
                 
                 echo "  🔑 Processing $key: '$cleaned_value'" >&2
                 
-                # Use a simple approach - create a temp JSON and merge
-                echo "{\"$key\":\"$cleaned_value\"}" > /tmp/single_var.json
-                jq -s '.[0] * .[1]' "$output_file" /tmp/single_var.json > /tmp/temp_merge.json && mv /tmp/temp_merge.json "$output_file"
-                rm -f /tmp/single_var.json
+                # Use Python to safely build JSON to avoid all jq issues
+                python3 -c "
+import json
+import sys
+
+# Read existing JSON
+try:
+    with open('$output_file', 'r') as f:
+        data = json.load(f)
+except:
+    data = {}
+
+# Add new key-value pair
+data['$key'] = '$cleaned_value'
+
+# Write back
+with open('$output_file', 'w') as f:
+    json.dump(data, f, ensure_ascii=False, separators=(',', ':'))
+"
               fi
             done < "$env_file"
           }
@@ -155,8 +170,23 @@ jobs:
             # Create new values JSON using the robust function
             clean_and_build_json ".env" "/tmp/new_vars.json"
             
-            # Merge existing with new values (new values override existing ones)
-            jq -s '.[0] * .[1]' /tmp/existing.json /tmp/new_vars.json > /tmp/merged.json
+            # Merge using Python to avoid all jq issues
+            python3 -c "
+import json
+
+# Read existing and new data
+with open('/tmp/existing.json', 'r') as f:
+    existing = json.load(f)
+with open('/tmp/new_vars.json', 'r') as f:
+    new_vars = json.load(f)
+
+# Merge (new values override existing ones)
+existing.update(new_vars)
+
+# Write merged result
+with open('/tmp/merged.json', 'w') as f:
+    json.dump(existing, f, ensure_ascii=False, separators=(',', ':'))
+"
             
             # Update secret with merged JSON as key-value pairs
             aws secretsmanager update-secret \
