@@ -1,8 +1,8 @@
 {
-  "encrypted_at": "2025-09-05T09:27:35Z",
-  "developer": "Developer: ingabireol <ingabire069@gmail.com>",
-  "original_file": ".env",
-  "original_hash": "453447f59941d0becd93e0548f23369f8910709ae3c1ada51a140166113a093d",
+  "encrypted_at": "2025-09-29T14:37:20Z",
+  "developer": "Developer: Bikaze <clmntmugisha@gmail.com>",
+  "original_file": "decrypted-env-vars",
+  "original_hash": "5bbec1b938cfe62b6ffe2840afc0e7baa2c76c760d3ad9f686769ff6fd2958f5",
   "encryption_method": "RSA-4096 + AES-256",
   "files": {
     "data": "encrypted-env-vars.enc",
