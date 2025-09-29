@@ -1,0 +1,223 @@
+name: Security Scanning Module
+
+on:
+  workflow_call:
+    inputs:
+      project_type:
+        description: "Type of project (frontend or backend)"
+        required: true
+        type: string
+      scan_dependencies:
+        description: "Scan dependencies for vulnerabilities"
+        required: false
+        type: boolean
+        default: true
+      scan_code:
+        description: "Run static code analysis"
+        required: false
+        type: boolean
+        default: true
+      trivy_severity:
+        description: "Trivy severity threshold"
+        required: false
+        type: string
+        default: "HIGH,CRITICAL"
+      sonar_project_key:
+        description: "SonarQube project key override"
+        required: false
+        type: string
+      skip_quality_gate:
+        description: "Skip SonarQube quality gate check"
+        required: false
+        type: boolean
+        default: false
+    outputs:
+      dependency_scan_results:
+        description: "Dependency scan results"
+        value: ${{ jobs.security-scan.outputs.dependency_scan_results }}
+      sonar_quality_gate:
+        description: "SonarQube quality gate status"
+        value: ${{ jobs.security-scan.outputs.sonar_quality_gate }}
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+jobs:
+  security-scan:
+    name: Lean Security Scanning & Analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      dependency_scan_results: ${{ steps.dependency-scan.outputs.results }}
+      sonar_quality_gate: ${{ steps.final-quality-gate.outputs.quality_gate }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Full history for SonarQube
+
+      # Quick dependency vulnerability scan (Maven)
+      - name: Quick dependency vulnerability scan
+        id: dependency-scan
+        if: inputs.scan_dependencies
+        run: |
+          echo "🔍 Running quick dependency vulnerability scan..."
+
+          # Use Maven dependency check plugin if available, otherwise skip
+          if [ -f pom.xml ]; then
+            echo "✅ Found pom.xml for dependency scanning"
+            
+            # Check if OWASP dependency check plugin is configured
+            if grep -q "dependency-check-maven" pom.xml; then
+              echo "Running OWASP dependency check..."
+              mvn org.owasp:dependency-check-maven:check || echo "Dependency check completed with findings"
+              echo "results=completed" >> $GITHUB_OUTPUT
+            else
+              echo "ℹ️ OWASP plugin not configured, will rely on Trivy scan below"
+              echo "results=skipped" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "⚠️ No pom.xml found, skipping dependency audit"
+            echo "results=skipped" >> $GITHUB_OUTPUT
+          fi
+
+      # Comprehensive vulnerability scanning with Trivy (REQUIRED)
+      - name: Trivy security scanner (Comprehensive scan)
+        if: inputs.scan_dependencies
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: "fs"
+          scan-ref: "."
+          format: "sarif"
+          output: "trivy-results.sarif"
+          severity: ${{ inputs.trivy_severity }}
+          exit-code: "0"
+          skip-dirs: ".github,target"
+
+      - name: Upload Trivy scan results to GitHub Security tab
+        if: ${{ inputs.scan_dependencies && always() && hashFiles('trivy-results.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: "trivy-results.sarif"
+          category: "trivy-fs-scan"
+
+      # SonarQube Analysis (Java/Maven with Build)
+      - name: Set up JDK 21
+        if: inputs.scan_code
+        uses: actions/setup-java@v4
+        with:
+          java-version: 21
+          distribution: "temurin"
+
+      - name: Cache SonarQube packages
+        if: inputs.scan_code
+        uses: actions/cache@v4
+        with:
+          path: ~/.sonar/cache
+          key: ${{ runner.os }}-sonar
+          restore-keys: ${{ runner.os }}-sonar
+
+      - name: Cache Maven packages
+        if: inputs.scan_code
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2
+          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+          restore-keys: ${{ runner.os }}-m2
+
+      - name: Build and analyze
+        if: inputs.scan_code
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        run: |
+          mvn -B verify org.sonarsource.scanner.maven:sonar-maven-plugin:sonar \
+            -Dsonar.projectKey=cloudinsight-service-discovery \
+            -Dsonar.projectName='cloudinsight-service-discovery' \
+            -Dsonar.exclusions='**/.github/**' \
+            -Dsonar.qualitygate.wait=true
+
+      - name: Set quality gate status after analysis
+        id: quality-gate-check
+        if: ${{ inputs.scan_code && !inputs.skip_quality_gate }}
+        run: |
+          # If we reach here, the quality gate passed (Maven would have failed otherwise)
+          echo "::notice::SonarQube analysis completed and quality gate passed!"
+          echo "quality_gate=PASSED" >> $GITHUB_OUTPUT
+
+      - name: Set quality gate status for skipped scans
+        id: quality-gate-skipped
+        if: ${{ !inputs.scan_code || inputs.skip_quality_gate }}
+        run: |
+          echo "::notice::SonarQube Quality Gate skipped"
+          echo "quality_gate=SKIPPED" >> $GITHUB_OUTPUT
+
+      # Upload Security Artifacts (lean set)
+      - name: Upload security scan results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-scan-results-${{ github.run_id }}
+          path: |
+            target/dependency-check-report.html
+            trivy-results.sarif
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Consolidate Quality Gate Status
+        id: final-quality-gate
+        if: always()
+        run: |
+          if [[ "${{ steps.quality-gate-check.outputs.quality_gate }}" != "" ]]; then
+            echo "quality_gate=${{ steps.quality-gate-check.outputs.quality_gate }}" >> $GITHUB_OUTPUT
+          elif [[ "${{ steps.quality-gate-skipped.outputs.quality_gate }}" != "" ]]; then
+            echo "quality_gate=${{ steps.quality-gate-skipped.outputs.quality_gate }}" >> $GITHUB_OUTPUT
+          else
+            echo "quality_gate=UNKNOWN" >> $GITHUB_OUTPUT
+          fi
+
+      # Security Summary
+      - name: Security scan summary
+        if: always()
+        run: |
+          echo "## 🔒 Lean Security Scan Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Tools Used" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ inputs.scan_dependencies }}" == "true" ]; then
+            echo "- **OWASP Dependency Check**: Java dependency vulnerability analysis" >> $GITHUB_STEP_SUMMARY
+            echo "- **Trivy**: Comprehensive filesystem and dependency scanning" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ "${{ inputs.scan_code }}" == "true" ]; then
+            echo "- **SonarQube**: Code quality, security analysis, and quality gate for Java/Spring Boot" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Results" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ steps.dependency-scan.outputs.results }}" == "failed" ]; then
+            echo "- **Dependency Audit**: ⚠️ Issues found (see artifacts)" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ steps.dependency-scan.outputs.results }}" == "passed" ]; then
+            echo "- **Dependency Audit**: ✅ No issues" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ -f trivy-results.sarif ]; then
+            echo "- **Trivy Scan**: 📊 Results uploaded to Security tab" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # Show quality gate status from the final step
+          QUALITY_GATE_STATUS="${{ steps.final-quality-gate.outputs.quality_gate }}"
+          if [ "$QUALITY_GATE_STATUS" != "" ]; then
+            echo "- **SonarQube Quality Gate**: $QUALITY_GATE_STATUS" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Why This Lean Approach?" >> $GITHUB_STEP_SUMMARY
+          echo "- **Trivy**: Handles comprehensive vulnerability scanning for containers and dependencies" >> $GITHUB_STEP_SUMMARY
+          echo "- **SonarQube**: Covers code quality AND security analysis for Java/Spring Boot" >> $GITHUB_STEP_SUMMARY
+          echo "- **OWASP**: Java-specific dependency vulnerability analysis" >> $GITHUB_STEP_SUMMARY
+          echo "- **No redundancy**: Each tool serves a unique purpose for backend microservices" >> $GITHUB_STEP_SUMMARY

@@ -1,0 +1,309 @@
+name: Notification Module
+
+on:
+  workflow_call:
+    inputs:
+      status:
+        description: "Pipeline status (success, failure, cancelled)"
+        required: true
+        type: string
+      stage:
+        description: "Stage that completed/failed"
+        required: true
+        type: string
+      version:
+        description: "Version created (if applicable)"
+        required: false
+        type: string
+      image_uri:
+        description: "Image URI (if applicable)"
+        required: false
+        type: string
+      sonar_quality_gate:
+        description: "SonarQube quality gate status"
+        required: false
+        type: string
+      build_needed:
+        description: "Whether build was needed and executed"
+        required: false
+        type: string
+      quality_result:
+        description: "Quality tests result"
+        required: false
+        type: string
+      security_result:
+        description: "Security scan result"
+        required: false
+        type: string
+      build_result:
+        description: "Build result"
+        required: false
+        type: string
+      triggered_by:
+        description: "User who triggered the workflow"
+        required: false
+        type: string
+      trigger_event:
+        description: "Event that triggered the workflow"
+        required: false
+        type: string
+      trigger_time:
+        description: "When the workflow was triggered"
+        required: false
+        type: string
+      workflow_url:
+        description: "Direct link to the workflow run"
+        required: false
+        type: string
+      run_url:
+        description: "GitHub Actions run URL"
+        required: false
+        type: string
+        default: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+jobs:
+  slack-notification:
+    name: Slack Notification
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: always()
+
+    steps:
+      - name: Determine notification details
+        id: details
+        run: |
+          STATUS="${{ inputs.status }}"
+          STAGE="${{ inputs.stage }}"
+
+          case "$STATUS" in
+            success)
+              COLOR="good"
+              EMOJI="✅"
+              TITLE="Pipeline Successful"
+              ;;
+            failure)
+              COLOR="danger"
+              EMOJI="❌"
+              TITLE="Pipeline Failed"
+              ;;
+            cancelled)
+              COLOR="warning"
+              EMOJI="⚠️"
+              TITLE="Pipeline Cancelled"
+              ;;
+            *)
+              COLOR="#808080"
+              EMOJI="ℹ️"
+              TITLE="Pipeline Update"
+              ;;
+          esac
+
+          echo "color=$COLOR" >> $GITHUB_OUTPUT
+          echo "emoji=$EMOJI" >> $GITHUB_OUTPUT
+          echo "title=$TITLE" >> $GITHUB_OUTPUT
+
+      - name: Prepare enhanced Slack payload
+        id: payload
+        run: |
+          # Get current timestamp in CAT (Central Africa Time, UTC+2)
+          TIMESTAMP=$(TZ='Africa/Johannesburg' date '+%Y-%m-%d %H:%M:%S CAT')
+
+          # Determine build status and details
+          BUILD_NEEDED="${{ inputs.build_needed }}"
+          BUILD_RESULT="${{ inputs.build_result }}"
+          QUALITY_RESULT="${{ inputs.quality_result }}"
+          SECURITY_RESULT="${{ inputs.security_result }}"
+          VERSION="${{ inputs.version }}"
+          IMAGE_URI="${{ inputs.image_uri }}"
+          TRIGGERED_BY="${{ inputs.triggered_by }}"
+          TRIGGER_EVENT="${{ inputs.trigger_event }}"
+
+          # Build status summary
+          STATUS_SUMMARY=""
+          WORKFLOW_STEPS=""
+
+          # Quality Tests
+          case "$QUALITY_RESULT" in
+            "success") QUALITY_ICON="✅"; QUALITY_STATUS="Passed" ;;
+            "failure") QUALITY_ICON="❌"; QUALITY_STATUS="Failed" ;;
+            "cancelled") QUALITY_ICON="⚠️"; QUALITY_STATUS="Cancelled" ;;
+            "skipped") QUALITY_ICON="⏭️"; QUALITY_STATUS="Skipped" ;;
+            *) QUALITY_ICON="⚪"; QUALITY_STATUS="Unknown" ;;
+          esac
+
+          # Security Scan
+          case "$SECURITY_RESULT" in
+            "success") SECURITY_ICON="🛡️"; SECURITY_STATUS="Passed" ;;
+            "failure") SECURITY_ICON="🚨"; SECURITY_STATUS="Failed" ;;
+            "cancelled") SECURITY_ICON="⚠️"; SECURITY_STATUS="Cancelled" ;;
+            "skipped") SECURITY_ICON="⏭️"; SECURITY_STATUS="Skipped" ;;
+            *) SECURITY_ICON="⚪"; SECURITY_STATUS="Unknown" ;;
+          esac
+
+          # Build & Deploy
+          if [ "$BUILD_NEEDED" == "true" ]; then
+            case "$BUILD_RESULT" in
+              "success") BUILD_ICON="🚀"; BUILD_STATUS="Built & Deployed" ;;
+              "failure") BUILD_ICON="💥"; BUILD_STATUS="Build Failed" ;;
+              "cancelled") BUILD_ICON="⚠️"; BUILD_STATUS="Build Cancelled" ;;
+              "skipped") BUILD_ICON="⏭️"; BUILD_STATUS="Build Skipped" ;;
+              *) BUILD_ICON="⚪"; BUILD_STATUS="Unknown" ;;
+            esac
+          else
+            BUILD_ICON="⏭️"
+            BUILD_STATUS="Build Not Needed"
+          fi
+
+          # Create workflow steps section
+          WORKFLOW_STEPS="$QUALITY_ICON *Quality Tests:* $QUALITY_STATUS\n$SECURITY_ICON *Security Scan:* $SECURITY_STATUS\n$BUILD_ICON *Build & Deploy:* $BUILD_STATUS"
+
+          # Determine trigger description
+          case "$TRIGGER_EVENT" in
+            "push") TRIGGER_DESC="Push to branch" ;;
+            "pull_request") TRIGGER_DESC="Pull request" ;;
+            "workflow_dispatch") TRIGGER_DESC="Manual trigger" ;;
+            "schedule") TRIGGER_DESC="Scheduled run" ;;
+            *) TRIGGER_DESC="$TRIGGER_EVENT" ;;
+          esac
+
+          # Build main fields
+          MAIN_FIELDS='[
+            {
+              "type": "mrkdwn",
+              "text": "*🏢 Repository*\n`${{ github.repository }}`"
+            },
+            {
+              "type": "mrkdwn", 
+              "text": "*🌿 Branch*\n`${{ github.ref_name }}`"
+            },
+            {
+              "type": "mrkdwn",
+              "text": "*👤 Triggered By*\n'$TRIGGERED_BY'"
+            },
+            {
+              "type": "mrkdwn",
+              "text": "*⚡ Trigger*\n'$TRIGGER_DESC'"
+            },
+            {
+              "type": "mrkdwn",
+              "text": "*🕐 Time*\n'$TIMESTAMP'"
+            },
+            {
+              "type": "mrkdwn",
+              "text": "*📝 Commit*\n<${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}|`${GITHUB_SHA:0:8}`>"
+            }
+          ]'
+
+          # Add version and image info if available
+          ADDITIONAL_FIELDS=""
+          if [ -n "$VERSION" ] && [ "$VERSION" != "null" ]; then
+            ADDITIONAL_FIELDS="$ADDITIONAL_FIELDS,{\"type\": \"mrkdwn\", \"text\": \"*🏷️ Version*\\n\`$VERSION\`\"}"
+          fi
+
+          if [ -n "$IMAGE_URI" ] && [ "$IMAGE_URI" != "null" ]; then
+            ADDITIONAL_FIELDS="$ADDITIONAL_FIELDS,{\"type\": \"mrkdwn\", \"text\": \"*📦 Image*\\n\`$IMAGE_URI\`\"}"
+          fi
+
+          if [ -n "$ADDITIONAL_FIELDS" ]; then
+            MAIN_FIELDS="${MAIN_FIELDS%]}$ADDITIONAL_FIELDS]"
+          fi
+
+          # Create the complete payload with enhanced design
+          PAYLOAD=$(cat << EOF
+          {
+            "attachments": [
+              {
+                "color": "${{ steps.details.outputs.color }}",
+                "blocks": [
+                  {
+                    "type": "header",
+                    "text": {
+                      "type": "plain_text",
+                      "text": "${{ steps.details.outputs.emoji }} CloudInsight Service Discovery Pipeline"
+                    }
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": "*Pipeline Status:* ${{ steps.details.outputs.title }}"
+                    }
+                  },
+                  {
+                    "type": "divider"
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": "📋 *Workflow Steps*\\n$WORKFLOW_STEPS"
+                    }
+                  },
+                  {
+                    "type": "divider"
+                  },
+                  {
+                    "type": "section",
+                    "fields": $MAIN_FIELDS
+                  },
+                  {
+                    "type": "actions",
+                    "elements": [
+                      {
+                        "type": "button",
+                        "text": {
+                          "type": "plain_text",
+                          "text": "🔍 View Workflow Details"
+                        },
+                        "url": "${{ inputs.run_url }}",
+                        "style": "primary"
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+          EOF
+          )
+
+          # Save payload to output (escape newlines)
+          echo "payload<<EOF" >> $GITHUB_OUTPUT
+          echo "$PAYLOAD" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Send Slack notification
+        uses: 8398a7/action-slack@v3
+        with:
+          status: custom
+          custom_payload: ${{ steps.payload.outputs.payload }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: Enhanced Summary
+        run: |
+          echo "## 📢 Enhanced Notification Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🎯 Pipeline Results" >> $GITHUB_STEP_SUMMARY
+          echo "- **Overall Status:** ${{ inputs.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Quality Tests:** ${{ inputs.quality_result || 'unknown' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Security Scan:** ${{ inputs.security_result || 'unknown' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Build & Deploy:** ${{ inputs.build_result || 'skipped' }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📋 Context" >> $GITHUB_STEP_SUMMARY
+          echo "- **Triggered By:** ${{ inputs.triggered_by || github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Trigger Event:** ${{ inputs.trigger_event || github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Build Needed:** ${{ inputs.build_needed || 'unknown' }}" >> $GITHUB_STEP_SUMMARY
+
+          if [ -n "${{ inputs.version }}" ] && [ "${{ inputs.version }}" != "null" ]; then
+            echo "- **Version:** ${{ inputs.version }}" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ -n "${{ inputs.image_uri }}" ] && [ "${{ inputs.image_uri }}" != "null" ]; then
+            echo "- **Image:** ${{ inputs.image_uri }}" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🔗 Links" >> $GITHUB_STEP_SUMMARY
+          echo "- **Workflow Run:** ${{ inputs.run_url }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Notification sent to:** Slack" >> $GITHUB_STEP_SUMMARY

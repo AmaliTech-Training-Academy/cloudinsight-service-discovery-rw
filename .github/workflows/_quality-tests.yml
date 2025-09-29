@@ -1,0 +1,227 @@
+name: Quality Tests Module
+
+on:
+  workflow_call:
+    inputs:
+      java_version:
+        description: "Java version to use"
+        required: false
+        type: string
+        default: "21"
+      maven_version:
+        description: "Maven version to use"
+        required: false
+        type: string
+        default: "3.9.6"
+      coverage_threshold:
+        description: "Coverage threshold percentage"
+        required: false
+        type: number
+        default: 80
+      run_integration_tests:
+        description: "Run integration tests"
+        required: false
+        type: boolean
+        default: false
+    outputs:
+      test_results:
+        description: "Test execution results"
+        value: ${{ jobs.quality-tests.outputs.test_results }}
+      coverage_percentage:
+        description: "Code coverage percentage"
+        value: ${{ jobs.quality-tests.outputs.coverage_percentage }}
+      quality_status:
+        description: "Code quality check status"
+        value: ${{ jobs.quality-tests.outputs.quality_status }}
+
+permissions:
+  contents: read
+  checks: write
+  actions: read
+
+jobs:
+  quality-tests:
+    name: Quality Tests & Code Analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      test_results: ${{ steps.test-summary.outputs.test_results }}
+      coverage_percentage: ${{ steps.coverage.outputs.percentage }}
+      quality_status: ${{ steps.quality-check.outputs.status }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK ${{ inputs.java_version }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ inputs.java_version }}
+          distribution: "temurin"
+
+      - name: Cache Maven dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2
+          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+          restore-keys: ${{ runner.os }}-m2
+
+      - name: Validate Maven project
+        run: |
+          echo "🔍 Validating Maven project structure..."
+          if [ -f pom.xml ]; then
+            echo "✅ Found pom.xml"
+            mvn validate
+          else
+            echo "❌ No pom.xml found"
+            exit 1
+          fi
+
+      - name: Compile project
+        run: |
+          echo "🔨 Compiling Spring Boot microservice..."
+          mvn clean compile
+          echo "✅ Compilation successful"
+
+      - name: Code quality analysis with Checkstyle
+        id: quality-check
+        run: |
+          echo "🔍 Running code quality checks with Checkstyle..."
+          if mvn checkstyle:check 2>/dev/null; then
+            echo "status=passed" >> $GITHUB_OUTPUT
+            echo "✅ Code quality checks passed"
+          else
+            echo "status=failed" >> $GITHUB_OUTPUT
+            echo "❌ Code quality issues found"
+            echo "💡 Run 'mvn checkstyle:check' locally to see detailed issues"
+            # Don't fail the workflow, just report
+          fi
+
+      - name: Unit tests
+        run: |
+          echo "🧪 Running unit tests with coverage..."
+          mvn test \
+            -Dmaven.test.failure.ignore=true \
+            -Dspring.profiles.active=test \
+            jacoco:report
+
+      - name: Integration tests
+        if: ${{ inputs.run_integration_tests }}
+        run: |
+          echo "🔄 Running integration tests..."
+          mvn verify \
+            -Dmaven.test.failure.ignore=true \
+            -Dspring.profiles.active=test \
+            -Dtest.profile=integration
+
+      - name: Coverage analysis
+        id: coverage
+        run: |
+          if [ -f target/site/jacoco/jacoco.xml ]; then
+            # Parse JaCoCo XML for coverage percentage
+            COVERED_LINES=$(grep -o 'covered="[0-9]*"' target/site/jacoco/jacoco.xml | grep -o '[0-9]*' | awk '{sum+=$1} END{print sum}')
+            MISSED_LINES=$(grep -o 'missed="[0-9]*"' target/site/jacoco/jacoco.xml | grep -o '[0-9]*' | awk '{sum+=$1} END{print sum}')
+            
+            TOTAL_LINES=$((COVERED_LINES + MISSED_LINES))
+            
+            if [ "$TOTAL_LINES" -gt 0 ]; then
+              COVERAGE_PERCENT=$(awk -v c=$COVERED_LINES -v t=$TOTAL_LINES 'BEGIN{printf("%.2f", (c/t)*100)}')
+            else
+              COVERAGE_PERCENT=0
+            fi
+            
+            echo "percentage=$COVERAGE_PERCENT" >> $GITHUB_OUTPUT
+            
+            # Prominent coverage display
+            echo "==============================================="
+            echo "🎯 CODE COVERAGE ANALYSIS"
+            echo "==============================================="
+            echo "📊 Coverage: ${COVERAGE_PERCENT}% ($COVERED_LINES/$TOTAL_LINES lines)"
+            echo "==============================================="
+            
+            # Check if coverage meets threshold
+            THRESHOLD=${{ inputs.coverage_threshold }}
+            if (( $(echo "$COVERAGE_PERCENT >= $THRESHOLD" | bc -l) )); then
+              echo "✅ Coverage meets threshold ($THRESHOLD%)"
+            else
+              echo "❌ Coverage below threshold: $COVERAGE_PERCENT% < $THRESHOLD%"
+              echo "::warning::Code coverage ($COVERAGE_PERCENT%) is below the required threshold ($THRESHOLD%)"
+            fi
+            echo "==============================================="
+          else
+            echo "percentage=0" >> $GITHUB_OUTPUT
+            echo "⚠️ No JaCoCo coverage data found"
+          fi
+
+      - name: Test summary
+        id: test-summary
+        run: |
+          # Get coverage percentage from previous step
+          COVERAGE_PERCENT="${{ steps.coverage.outputs.percentage }}"
+          THRESHOLD=${{ inputs.coverage_threshold }}
+
+          # Create prominent summary header
+          echo "## 🧪 Quality Tests Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Coverage section with visual indicator
+          echo "### 📊 Code Coverage" >> $GITHUB_STEP_SUMMARY
+          if [ -n "$COVERAGE_PERCENT" ] && [ "$COVERAGE_PERCENT" != "0" ]; then
+            if (( $(echo "$COVERAGE_PERCENT >= $THRESHOLD" | bc -l) )); then
+              echo "✅ **${COVERAGE_PERCENT}%** (Target: ${THRESHOLD}%)" >> $GITHUB_STEP_SUMMARY
+              echo "> Coverage meets the required threshold" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "⚠️ **${COVERAGE_PERCENT}%** (Target: ${THRESHOLD}%)" >> $GITHUB_STEP_SUMMARY
+              echo "> ⚠️ Coverage is below the required threshold" >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "❌ **No coverage data available**" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Test results section
+          if [ -f target/surefire-reports/TEST-*.xml ]; then
+            TOTAL=$(find target/surefire-reports -name "TEST-*.xml" -exec grep -h 'testcase ' {} \; | wc -l)
+            FAILURES=$(find target/surefire-reports -name "TEST-*.xml" -exec grep -h 'failure ' {} \; | wc -l)
+            ERRORS=$(find target/surefire-reports -name "TEST-*.xml" -exec grep -h 'error ' {} \; | wc -l)
+            SKIPPED=$(find target/surefire-reports -name "TEST-*.xml" -exec grep -h 'skipped ' {} \; | wc -l)
+            
+            PASSED=$((TOTAL - FAILURES - ERRORS - SKIPPED))
+            
+            echo "test_results=total:$TOTAL,passed:$PASSED,failed:$FAILURES,errors:$ERRORS,skipped:$SKIPPED" >> $GITHUB_OUTPUT
+            
+            echo "### 🧪 Test Results" >> $GITHUB_STEP_SUMMARY
+            echo "| Metric | Count | Status |" >> $GITHUB_STEP_SUMMARY
+            echo "|--------|-------|--------|" >> $GITHUB_STEP_SUMMARY
+            echo "| **Total Tests** | $TOTAL | ℹ️ |" >> $GITHUB_STEP_SUMMARY
+            echo "| **Passed** | $PASSED | ✅ |" >> $GITHUB_STEP_SUMMARY
+            echo "| **Failed** | $FAILURES | ❌ |" >> $GITHUB_STEP_SUMMARY
+            echo "| **Errors** | $ERRORS | ⚠️ |" >> $GITHUB_STEP_SUMMARY
+            echo "| **Skipped** | $SKIPPED | ⏭️ |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "test_results=no_results" >> $GITHUB_OUTPUT
+            echo "### 🧪 Test Results" >> $GITHUB_STEP_SUMMARY
+            echo "❌ **No test results found**" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ github.run_id }}
+          path: |
+            target/surefire-reports/
+            target/site/jacoco/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Publish test results
+        if: ${{ always() && hashFiles('target/surefire-reports/TEST-*.xml') != '' }}
+        uses: dorny/test-reporter@v1
+        with:
+          name: Service Discovery Unit Tests
+          path: target/surefire-reports/TEST-*.xml
+          reporter: java-junit
+          fail-on-error: false
