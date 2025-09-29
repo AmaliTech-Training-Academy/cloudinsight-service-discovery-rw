@@ -94,7 +94,7 @@ jobs:
             echo "⏭️ $SKIP_REASON"
           # For push events (including PR merges), check target branches and analyze commits
           elif [ "${{ github.event_name }}" == "push" ]; then
-            TARGET_BRANCHES="development|staging|production"
+            TARGET_BRANCHES="main|development|staging|production"
             CURRENT_BRANCH="${{ github.ref_name }}"
             
             echo "📋 Current branch: $CURRENT_BRANCH"
@@ -103,7 +103,7 @@ jobs:
             # Check if pushing to target branch
             if [[ ! "$CURRENT_BRANCH" =~ ^($TARGET_BRANCHES)$ ]]; then
               BUILD_NEEDED="false"
-              SKIP_REASON="Not pushing to target branch ($CURRENT_BRANCH not in: development, staging, production)"
+              SKIP_REASON="Not pushing to target branch ($CURRENT_BRANCH not in: main, development, staging, production)"
               echo "⏭️ $SKIP_REASON"
             else
               # For staging/production branches, always build (they use different versioning strategies)
