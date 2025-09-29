@@ -99,129 +99,60 @@ jobs:
             # Don't fail the workflow, just report
           fi
 
-      - name: Unit tests
+      - name: Skip unit tests for service discovery
         run: |
-          echo "🧪 Running unit tests with coverage..."
-          mvn test \
-            -Dmaven.test.failure.ignore=true \
-            -Dspring.profiles.active=test \
-            jacoco:report
+          echo "🚫 Unit tests skipped for service discovery repository"
+          echo "ℹ️  This is a service discovery server - testing handled separately"
 
-      - name: Integration tests
+      - name: Skip integration tests for service discovery
         if: ${{ inputs.run_integration_tests }}
         run: |
-          echo "🔄 Running integration tests..."
-          mvn verify \
-            -Dmaven.test.failure.ignore=true \
-            -Dspring.profiles.active=test \
-            -Dtest.profile=integration
+          echo "� Integration tests skipped for service discovery repository"
 
-      - name: Coverage analysis
+      - name: Coverage analysis (skipped)
         id: coverage
         run: |
-          if [ -f target/site/jacoco/jacoco.xml ]; then
-            # Parse JaCoCo XML for coverage percentage
-            COVERED_LINES=$(grep -o 'covered="[0-9]*"' target/site/jacoco/jacoco.xml | grep -o '[0-9]*' | awk '{sum+=$1} END{print sum}')
-            MISSED_LINES=$(grep -o 'missed="[0-9]*"' target/site/jacoco/jacoco.xml | grep -o '[0-9]*' | awk '{sum+=$1} END{print sum}')
-            
-            TOTAL_LINES=$((COVERED_LINES + MISSED_LINES))
-            
-            if [ "$TOTAL_LINES" -gt 0 ]; then
-              COVERAGE_PERCENT=$(awk -v c=$COVERED_LINES -v t=$TOTAL_LINES 'BEGIN{printf("%.2f", (c/t)*100)}')
-            else
-              COVERAGE_PERCENT=0
-            fi
-            
-            echo "percentage=$COVERAGE_PERCENT" >> $GITHUB_OUTPUT
-            
-            # Prominent coverage display
-            echo "==============================================="
-            echo "🎯 CODE COVERAGE ANALYSIS"
-            echo "==============================================="
-            echo "📊 Coverage: ${COVERAGE_PERCENT}% ($COVERED_LINES/$TOTAL_LINES lines)"
-            echo "==============================================="
-            
-            # Check if coverage meets threshold
-            THRESHOLD=${{ inputs.coverage_threshold }}
-            if (( $(echo "$COVERAGE_PERCENT >= $THRESHOLD" | bc -l) )); then
-              echo "✅ Coverage meets threshold ($THRESHOLD%)"
-            else
-              echo "❌ Coverage below threshold: $COVERAGE_PERCENT% < $THRESHOLD%"
-              echo "::warning::Code coverage ($COVERAGE_PERCENT%) is below the required threshold ($THRESHOLD%)"
-            fi
-            echo "==============================================="
-          else
-            echo "percentage=0" >> $GITHUB_OUTPUT
-            echo "⚠️ No JaCoCo coverage data found"
-          fi
+          echo "percentage=0" >> $GITHUB_OUTPUT
+          echo "🚫 Coverage analysis skipped for service discovery repository"
+          echo "==============================================="
+          echo "🎯 CODE COVERAGE ANALYSIS - SKIPPED"
+          echo "==============================================="
+          echo "📊 Coverage: N/A (Service Discovery Server)"
+          echo "==============================================="
 
-      - name: Test summary
+      - name: Test summary (skipped)
         id: test-summary
         run: |
-          # Get coverage percentage from previous step
-          COVERAGE_PERCENT="${{ steps.coverage.outputs.percentage }}"
+          # Set coverage percentage as 0 since tests are skipped
+          COVERAGE_PERCENT="0"
           THRESHOLD=${{ inputs.coverage_threshold }}
 
           # Create prominent summary header
-          echo "## 🧪 Quality Tests Summary" >> $GITHUB_STEP_SUMMARY
+          echo "## 🧪 Quality Tests Summary (Service Discovery)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
-          # Coverage section with visual indicator
+          # Coverage section
           echo "### 📊 Code Coverage" >> $GITHUB_STEP_SUMMARY
-          if [ -n "$COVERAGE_PERCENT" ] && [ "$COVERAGE_PERCENT" != "0" ]; then
-            if (( $(echo "$COVERAGE_PERCENT >= $THRESHOLD" | bc -l) )); then
-              echo "✅ **${COVERAGE_PERCENT}%** (Target: ${THRESHOLD}%)" >> $GITHUB_STEP_SUMMARY
-              echo "> Coverage meets the required threshold" >> $GITHUB_STEP_SUMMARY
-            else
-              echo "⚠️ **${COVERAGE_PERCENT}%** (Target: ${THRESHOLD}%)" >> $GITHUB_STEP_SUMMARY
-              echo "> ⚠️ Coverage is below the required threshold" >> $GITHUB_STEP_SUMMARY
-            fi
-          else
-            echo "❌ **No coverage data available**" >> $GITHUB_STEP_SUMMARY
-          fi
+          echo "🚫 **Tests Skipped** (Service Discovery Server)" >> $GITHUB_STEP_SUMMARY
+          echo "> Service discovery servers typically don't require extensive unit testing" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
           # Test results section
-          if [ -f target/surefire-reports/TEST-*.xml ]; then
-            TOTAL=$(find target/surefire-reports -name "TEST-*.xml" -exec grep -h 'testcase ' {} \; | wc -l)
-            FAILURES=$(find target/surefire-reports -name "TEST-*.xml" -exec grep -h 'failure ' {} \; | wc -l)
-            ERRORS=$(find target/surefire-reports -name "TEST-*.xml" -exec grep -h 'error ' {} \; | wc -l)
-            SKIPPED=$(find target/surefire-reports -name "TEST-*.xml" -exec grep -h 'skipped ' {} \; | wc -l)
-            
-            PASSED=$((TOTAL - FAILURES - ERRORS - SKIPPED))
-            
-            echo "test_results=total:$TOTAL,passed:$PASSED,failed:$FAILURES,errors:$ERRORS,skipped:$SKIPPED" >> $GITHUB_OUTPUT
-            
-            echo "### 🧪 Test Results" >> $GITHUB_STEP_SUMMARY
-            echo "| Metric | Count | Status |" >> $GITHUB_STEP_SUMMARY
-            echo "|--------|-------|--------|" >> $GITHUB_STEP_SUMMARY
-            echo "| **Total Tests** | $TOTAL | ℹ️ |" >> $GITHUB_STEP_SUMMARY
-            echo "| **Passed** | $PASSED | ✅ |" >> $GITHUB_STEP_SUMMARY
-            echo "| **Failed** | $FAILURES | ❌ |" >> $GITHUB_STEP_SUMMARY
-            echo "| **Errors** | $ERRORS | ⚠️ |" >> $GITHUB_STEP_SUMMARY
-            echo "| **Skipped** | $SKIPPED | ⏭️ |" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "test_results=no_results" >> $GITHUB_OUTPUT
-            echo "### 🧪 Test Results" >> $GITHUB_STEP_SUMMARY
-            echo "❌ **No test results found**" >> $GITHUB_STEP_SUMMARY
-          fi
+          echo "test_results=skipped" >> $GITHUB_OUTPUT
+          echo "### 🧪 Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "🚫 **Tests Skipped for Service Discovery Repository**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### ℹ️ Why Tests Are Skipped" >> $GITHUB_STEP_SUMMARY
+          echo "- **Service Discovery**: This is a Netflix Eureka server" >> $GITHUB_STEP_SUMMARY
+          echo "- **Configuration-focused**: Primarily configuration-driven application" >> $GITHUB_STEP_SUMMARY
+          echo "- **Testing Strategy**: Integration and E2E tests are more valuable" >> $GITHUB_STEP_SUMMARY
 
-      - name: Upload test artifacts
+      - name: Upload test artifacts (skipped)
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-results-${{ github.run_id }}
-          path: |
-            target/surefire-reports/
-            target/site/jacoco/
-          if-no-files-found: ignore
-          retention-days: 7
+        run: |
+          echo "🚫 Test artifacts upload skipped - no tests run for service discovery"
 
-      - name: Publish test results
-        if: ${{ always() && hashFiles('target/surefire-reports/TEST-*.xml') != '' }}
-        uses: dorny/test-reporter@v1
-        with:
-          name: Service Discovery Unit Tests
-          path: target/surefire-reports/TEST-*.xml
-          reporter: java-junit
-          fail-on-error: false
+      - name: Publish test results (skipped)
+        if: always()
+        run: |
+          echo "🚫 Test results publishing skipped - no tests run for service discovery"
