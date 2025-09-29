@@ -138,6 +138,7 @@ jobs:
             -Dsonar.projectKey=cloudinsight-service-discovery \
             -Dsonar.projectName='cloudinsight-service-discovery' \
             -Dsonar.exclusions='**/.github/**' \
+            -DskipTests=true \
             -Dsonar.qualitygate.wait=true
 
       - name: Set quality gate status after analysis

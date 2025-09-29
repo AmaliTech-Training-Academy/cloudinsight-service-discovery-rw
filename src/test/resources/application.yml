@@ -1,0 +1,32 @@
+# Test configuration for Eureka Server Application Tests
+# These values are used only during testing to resolve placeholders
+
+server:
+  port: 8761
+
+spring:
+  application:
+    name: eureka-server-test
+
+eureka:
+  client:
+    registerWithEureka: false
+    fetchRegistry: false
+    serviceUrl:
+      defaultZone: http://localhost:8761/eureka/
+  instance:
+    prefer-ip-address: true
+    lease-renewal-interval-in-seconds: 30
+    lease-expiration-duration-in-seconds: 90
+  server:
+    enable-self-preservation: false
+    eviction-interval-timer-in-ms: 60000
+    renewal-percent-threshold: 0.85
+    response-cache-update-interval-ms: 30000
+    response-cache-auto-expiration-in-seconds: 600
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
