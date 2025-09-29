@@ -1,0 +1,1040 @@
+name: Build, Version and Push Module
+
+on:
+  workflow_call:
+    inputs:
+      project_type:
+        description: "Type of project (frontend or backend)"
+        required: true
+        type: string
+      java_version:
+        description: "Java version to use"
+        required: false
+        type: string
+        default: "21"
+      maven_version:
+        description: "Maven version to use"
+        required: false
+        type: string
+        default: "3.9.6"
+      build_only:
+        description: "Only build the image, do not version and push"
+        required: false
+        type: boolean
+        default: false
+      push_secrets:
+        description: "Push decrypted secrets to AWS Secrets Manager"
+        required: false
+        type: boolean
+        default: false
+      trivy_severity:
+        description: "Trivy vulnerability scanner severity threshold"
+        required: false
+        type: string
+        default: "HIGH,CRITICAL"
+    outputs:
+      image_id:
+        description: "Built image ID"
+        value: ${{ jobs.build-version-push.outputs.image_id }}
+      image_tag:
+        description: "Image tag without registry"
+        value: ${{ jobs.build-version-push.outputs.image_tag }}
+      version:
+        description: "Generated version"
+        value: ${{ jobs.build-version-push.outputs.version }}
+      image_uri:
+        description: "Pushed image URI"
+        value: ${{ jobs.build-version-push.outputs.image_uri }}
+      build_needed:
+        description: "Whether build was needed and executed"
+        value: ${{ jobs.check-build-needed.outputs.build_needed }}
+
+permissions:
+  contents: write
+  packages: write
+  security-events: write
+
+jobs:
+  check-build-needed:
+    name: Check if Build is Needed
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      build_needed: ${{ steps.analyze.outputs.build_needed }}
+      skip_reason: ${{ steps.analyze.outputs.skip_reason }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Analyze if build is needed
+        id: analyze
+        run: |
+          BUILD_NEEDED="true"
+          SKIP_REASON=""
+
+          echo "🔍 Analyzing build requirements..."
+          echo "📋 Event: ${{ github.event_name }}"
+          echo "📋 Ref: ${{ github.ref }}"
+          echo "📋 Branch: ${{ github.ref_name }}"
+          echo "📋 Is manual trigger: ${{ github.event_name == 'workflow_dispatch' }}"
+
+          # Skip if manual trigger (workflow_dispatch)
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            BUILD_NEEDED="false"
+            SKIP_REASON="Manual trigger - build skipped by design"
+            echo "⏭️ $SKIP_REASON"
+
+          # Skip if pull request - we only build after PR is merged, not during PR creation
+          elif [ "${{ github.event_name }}" == "pull_request" ]; then
+            BUILD_NEEDED="false"
+            SKIP_REASON="Pull request - build skipped until PR is approved and merged"
+            echo "⏭️ $SKIP_REASON"
+          # For push events (including PR merges), check target branches and analyze commits
+          elif [ "${{ github.event_name }}" == "push" ]; then
+            TARGET_BRANCHES="development|staging|production"
+            CURRENT_BRANCH="${{ github.ref_name }}"
+            
+            echo "📋 Current branch: $CURRENT_BRANCH"
+            echo "📋 Target branches: $TARGET_BRANCHES"
+            
+            # Check if pushing to target branch
+            if [[ ! "$CURRENT_BRANCH" =~ ^($TARGET_BRANCHES)$ ]]; then
+              BUILD_NEEDED="false"
+              SKIP_REASON="Not pushing to target branch ($CURRENT_BRANCH not in: development, staging, production)"
+              echo "⏭️ $SKIP_REASON"
+            else
+              # For staging/production branches, always build (they use different versioning strategies)
+              if [ "$CURRENT_BRANCH" == "staging" ]; then
+                echo "🔄 Staging branch detected - always build to create RC version"
+                BUILD_NEEDED="true"
+                
+              elif [ "$CURRENT_BRANCH" == "production" ]; then
+                echo "🚀 Production branch detected - always build to promote RC version"
+                BUILD_NEEDED="true"
+                
+              else
+                # For development branches, analyze recent commits (including PR merges)
+                echo "🔍 Analyzing commits for build-requiring changes..."
+                
+                # Get recent commits since last tag, or last 10 commits if no tags
+                LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+                
+                if [ -n "$LAST_TAG" ]; then
+                  COMMITS=$(git log ${LAST_TAG}..HEAD --oneline)
+                  echo "📋 Commits since last tag ($LAST_TAG):"
+                else
+                  COMMITS=$(git log --oneline -10)
+                  echo "📋 Recent commits (no tags found):"
+                fi
+                
+                # If this is a merge commit from a PR, also analyze the PR commits
+                LATEST_COMMIT=$(git log -1 --oneline)
+                if echo "$LATEST_COMMIT" | grep -q "Merge pull request"; then
+                  echo "🔍 Detected PR merge - analyzing PR commits..."
+                  MERGE_COMMIT=$(echo "$LATEST_COMMIT" | cut -d' ' -f1)
+                  PR_COMMITS=$(git log ${MERGE_COMMIT}^1..${MERGE_COMMIT}^2 --oneline 2>/dev/null || echo "")
+                  if [ -n "$PR_COMMITS" ]; then
+                    echo "📋 PR commits being merged:"
+                    echo "$PR_COMMITS"
+                    # Include PR commits in addition to all commits since last tag
+                    # This ensures we analyze ALL commits, not just PR commits
+                    echo "📋 Analyzing ALL commits since last tag (including PR and intermediate commits)"
+                  fi
+                fi
+                
+                echo "📋 Analyzing commits:"
+                echo "$COMMITS"
+                
+                # Analyze commit messages for build-requiring changes
+                # Use traditional conventional commit patterns only
+                BREAKING_CHANGES=$(echo "$COMMITS" | grep -iE "(BREAKING CHANGE:|^[a-f0-9]+ [^:]+!:|^[a-f0-9]+ [^(]+\([^)]*\)!:)" | wc -l)
+                FEATURES=$(echo "$COMMITS" | grep -iE "(^[a-f0-9]+ feat(\([^)]*\))?:)" | wc -l)
+                FIXES=$(echo "$COMMITS" | grep -iE "(^[a-f0-9]+ fix(\([^)]*\))?:)" | wc -l)
+                BUILD_CHANGES=$(echo "$COMMITS" | grep -iE "(^[a-f0-9]+ (build|ci|perf|refactor)(\([^)]*\))?:)" | wc -l)
+                
+                echo "📊 Change analysis:"
+                echo "  - Breaking changes: $BREAKING_CHANGES"
+                echo "  - Features: $FEATURES"
+                echo "  - Fixes: $FIXES"
+                echo "  - Build/CI changes: $BUILD_CHANGES"
+                
+                # Build is needed if there are features, fixes, breaking changes, or build changes
+                if [ "$BREAKING_CHANGES" -gt 0 ] || [ "$FEATURES" -gt 0 ] || [ "$FIXES" -gt 0 ] || [ "$BUILD_CHANGES" -gt 0 ]; then
+                  BUILD_NEEDED="true"
+                  echo "✅ Build needed - found changes requiring build"
+                else
+                  BUILD_NEEDED="false"
+                  SKIP_REASON="No build-requiring changes found (only docs, chore, style, test, etc.)"
+                  echo "⏭️ $SKIP_REASON"
+                fi
+              fi
+            fi
+          fi
+
+          echo "🎯 Final decision: BUILD_NEEDED=$BUILD_NEEDED"
+          if [ "$BUILD_NEEDED" == "false" ]; then
+            echo "📝 Reason: $SKIP_REASON"
+          fi
+
+          echo "build_needed=$BUILD_NEEDED" >> $GITHUB_OUTPUT
+          echo "skip_reason=$SKIP_REASON" >> $GITHUB_OUTPUT
+
+  build-version-push:
+    name: Build, Version & Push Container Image
+    runs-on: ubuntu-latest
+    needs: [check-build-needed]
+    if: ${{ needs.check-build-needed.outputs.build_needed == 'true' }}
+    timeout-minutes: 45
+    environment: ${{ github.ref == 'refs/heads/production' && 'production' || github.ref == 'refs/heads/staging' && 'staging' || 'development' }}
+    outputs:
+      image_id: ${{ steps.build.outputs.imageid }}
+      image_tag: cloudinsight-backend-microservice:${{ github.sha }}
+      version: ${{ steps.version.outputs.new_version }}
+      image_uri: ${{ steps.push.outputs.image_uri }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build justification
+        run: |
+          echo "🚀 Build is proceeding based on analysis:"
+          echo "📋 Event: ${{ github.event_name }}"
+          echo "📋 Branch: ${{ github.ref_name }}"
+          echo "✅ Build required - proceeding with container build and deployment"
+
+      - name: Debug git state for troubleshooting
+        run: |
+          echo "🔍 Git state debugging:"
+          echo "📋 Current branch: $(git branch --show-current)"
+          echo "📋 Remote branches:"
+          git branch -r | head -10
+          echo "📋 Recent commits (last 5):"
+          git log --oneline -5
+          echo "📋 Last tag: $(git describe --tags --abbrev=0 2>/dev/null || echo 'No tags found')"
+
+      - name: Set up JDK ${{ inputs.java_version }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ inputs.java_version }}
+          distribution: "temurin"
+
+      - name: Cache Maven dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2
+          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+          restore-keys: ${{ runner.os }}-m2
+
+      - name: Decrypt environment variables
+        id: decrypt-env
+        run: |
+          echo "🔍 Checking for encrypted environment files..."
+
+          # Find encrypted files in repository root
+          ENCRYPTED_DATA=$(find . -maxdepth 1 -name "encrypted-env-vars.enc" -type f | head -1)
+          ENCRYPTED_KEY=$(find . -maxdepth 1 -name "encrypted-aes-key.enc" -type f | head -1)
+          METADATA=$(find . -maxdepth 1 -name "encrypted-env-vars.meta" -type f | head -1)
+
+          if [[ -z "$ENCRYPTED_DATA" || -z "$ENCRYPTED_KEY" ]]; then
+            echo "ℹ️ No encrypted environment files found - continuing without decryption"
+            echo "has_encrypted_env=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "✅ Found encrypted files:"
+          echo "  Data: $ENCRYPTED_DATA"
+          echo "  Key: $ENCRYPTED_KEY"
+          if [[ -n "$METADATA" ]]; then
+            echo "  Metadata: $METADATA"
+          fi
+          echo "has_encrypted_env=true" >> $GITHUB_OUTPUT
+
+          # Create private key from secret
+          echo "🔑 Setting up private key for decryption..."
+          echo "${{ secrets.TEAM_PRIVATE_KEY }}" > ./team-private-key.pem
+          chmod 600 ./team-private-key.pem
+
+          # Verify private key
+          if ! openssl rsa -in ./team-private-key.pem -check -noout; then
+            echo "❌ Invalid private key in TEAM_PRIVATE_KEY secret"
+            exit 1
+          fi
+          echo "✅ Private key validated"
+
+          # Show metadata if available (without sensitive content)
+          if [[ -n "$METADATA" && -f "$METADATA" ]]; then
+            echo "📋 Encryption Metadata:"
+            echo "======================="
+            cat "$METADATA"
+            echo "======================="
+          fi
+
+          # Decrypt AES key
+          echo "🔓 Decrypting AES key..."
+          if ! openssl rsautl -decrypt \
+            -inkey ./team-private-key.pem \
+            -in "$ENCRYPTED_KEY" \
+            -out ./temp-aes-key; then
+            echo "❌ Failed to decrypt AES key"
+            exit 1
+          fi
+
+          # Read AES key
+          AES_KEY=$(cat ./temp-aes-key)
+
+          # Decrypt data (try GCM first, then CBC)
+          echo "🔓 Decrypting environment data..."
+          if openssl enc -aes-256-gcm -d \
+            -in "$ENCRYPTED_DATA" \
+            -out "./.env" \
+            -pass "pass:$AES_KEY" 2>/dev/null; then
+            echo "✅ Decrypted with AES-GCM"
+          elif openssl enc -aes-256-cbc -d \
+            -in "$ENCRYPTED_DATA" \
+            -out "./.env" \
+            -pass "pass:$AES_KEY" 2>/dev/null; then
+            echo "✅ Decrypted with AES-CBC"
+          else
+            echo "❌ Decryption failed with both AES-GCM and AES-CBC"
+            exit 1
+          fi
+
+          # Verify decrypted content (without exposing content)
+          if [[ -f "./.env" ]]; then
+            LINES=$(wc -l < "./.env")
+            SIZE=$(stat -c%s "./.env")
+            echo "✅ Decryption completed successfully!"
+            echo "📋 Decrypted .env file: $LINES lines, $SIZE bytes"
+            echo "⚠️ Environment variables are available for build process only"
+            
+            # Ensure .env is not tracked by git
+            git add .gitignore 2>/dev/null || true
+            
+            # Clean up temporary key files (keep .env for later steps)
+            rm -f ./team-private-key.pem ./temp-aes-key
+            echo "🧹 Cleaned up temporary key files"
+          else
+            echo "❌ Decryption produced no output file"
+            exit 1
+          fi
+
+      - name: Extract environment variables
+        id: extract-env
+        if: steps.decrypt-env.outputs.has_encrypted_env == 'true'
+        run: |
+          echo "🔍 Processing environment variables for backend microservice..."
+
+          if [[ ! -f "./.env" ]]; then
+            exit 0
+          fi
+
+          # Count all environment variables (without exposing values in logs)
+          ENV_VARS=$(grep -v '^#' ./.env | grep -v '^$' 2>/dev/null || true)
+
+          if [[ -z "$ENV_VARS" ]]; then
+            echo "ℹ️ No environment variables found"
+            echo "has_env_vars=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Count variables found (without showing values)
+          VAR_COUNT=$(echo "$ENV_VARS" | wc -l)
+          echo "✅ Found $VAR_COUNT environment variables"
+          echo "has_env_vars=true" >> $GITHUB_OUTPUT
+
+          # Mask sensitive values in logs
+          echo "$ENV_VARS" | while IFS='=' read -r key value; do
+            if [[ -n "$value" ]]; then
+              echo "::add-mask::$value"
+            fi
+          done
+
+          echo "🔒 Environment variables prepared for AWS Secrets Manager (values masked in logs)"
+
+      - name: Configure AWS credentials
+        if: ${{ inputs.push_secrets || !inputs.build_only }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Push secrets to AWS Secrets Manager
+        if: ${{ inputs.push_secrets && steps.decrypt-env.outputs.has_encrypted_env == 'true' }}
+        run: |
+          echo "🔐 Pushing secrets to AWS Secrets Manager..."
+
+          if [[ ! -f "./.env" ]]; then
+            echo "⚠️ No .env file found - skipping secrets push"
+            exit 0
+          fi
+
+          # Use environment-scoped secret name (no suffix needed)
+          SECRET_NAME="${{ secrets.AWS_SECRETS_MANAGER_SECRET_NAME }}"
+
+          if [[ -z "$SECRET_NAME" ]]; then
+            echo "❌ AWS_SECRETS_MANAGER_SECRET_NAME environment secret not configured"
+            exit 1
+          fi
+
+          echo "🌍 Target Environment: ${{ github.ref }}"
+          echo "🔐 Secret Name: $SECRET_NAME"
+
+          # Create JSON from .env file
+          echo "📝 Creating JSON from .env file..."
+
+          # Create a temporary file to build JSON properly
+          JSON_TEMP_FILE=$(mktemp)
+          echo "{" > "$JSON_TEMP_FILE"
+
+          # Process .env file line by line
+          while IFS='=' read -r key value; do
+            # Skip comments and empty lines
+            if [[ "$key" =~ ^[[:space:]]*# ]] || [[ -z "$key" ]] || [[ -z "$value" ]]; then
+              continue
+            fi
+            
+            # Remove any trailing carriage return or whitespace
+            key=$(echo "$key" | tr -d '\r' | xargs)
+            value=$(echo "$value" | tr -d '\r')
+            
+            # Skip database-related variables (don't push to AWS Secrets)
+            if [[ "$key" == "DB_URL" ]] || [[ "$key" == "DB_USERNAME" ]] || [[ "$key" == "DB_PASSWORD" ]]; then
+              echo "⏭️ Skipping database variable: $key (excluded from AWS Secrets)"
+              continue
+            fi
+            
+            # Clean up comments from values (remove everything after #)
+            clean_value=$(echo "$value" | sed 's/[[:space:]]*#.*$//')
+            
+            # Escape quotes in the cleaned value and add to JSON
+            escaped_value=$(echo "$clean_value" | sed 's/"/\\"/g')
+            echo "  \"$key\": \"$escaped_value\"," >> "$JSON_TEMP_FILE"
+          done < ./.env
+
+          # Remove the last comma and close the JSON
+          sed -i '$ s/,$//' "$JSON_TEMP_FILE"
+          echo "}" >> "$JSON_TEMP_FILE"
+
+          # Read the complete JSON
+          NEW_SECRET_JSON=$(cat "$JSON_TEMP_FILE")
+          rm -f "$JSON_TEMP_FILE"
+
+          # Validate JSON syntax
+          if ! echo "$NEW_SECRET_JSON" | jq empty 2>/dev/null; then
+            echo "❌ Generated invalid JSON from .env file"
+            echo "Generated JSON: $NEW_SECRET_JSON"
+            exit 1
+          fi
+
+          echo "✅ Valid JSON created from .env file"
+
+          # Always use merge strategy - assume secret exists
+          echo "🔄 Implementing merge strategy for existing secret..."
+
+          # Get existing secret
+          echo "📄 Retrieving existing secret: $SECRET_NAME"
+          EXISTING_SECRET=$(aws secretsmanager get-secret-value --secret-id "$SECRET_NAME" --query SecretString --output text)
+
+          if [[ -z "$EXISTING_SECRET" ]]; then
+            echo "❌ Failed to retrieve existing secret or secret is empty"
+            exit 1
+          fi
+
+          # Validate existing secret JSON
+          if ! echo "$EXISTING_SECRET" | jq empty 2>/dev/null; then
+            echo "❌ Existing secret contains invalid JSON"
+            exit 1
+          fi
+          echo "✅ Existing secret JSON is valid"
+
+          # Merge existing and new secrets using jq
+          echo "🔀 Merging new values with existing secret (preserving untouched variables)..."
+          MERGED_SECRET=$(echo "$EXISTING_SECRET" | jq --argjson new "$NEW_SECRET_JSON" '. + $new')
+
+          if [[ -z "$MERGED_SECRET" ]]; then
+            echo "❌ Failed to merge secrets"
+            exit 1
+          fi
+          echo "✅ Secrets merged successfully"
+
+          # Update secret with merged values
+          echo "✅ Updating secret with merged values..."
+          aws secretsmanager update-secret \
+            --secret-id "$SECRET_NAME" \
+            --secret-string "$MERGED_SECRET"
+            
+          echo "📊 Merge completed successfully - existing values preserved, only specified values updated"
+
+          echo "🎯 Secrets deployment completed for: $SECRET_NAME"
+
+      - name: Login to Amazon ECR
+        if: ${{ !inputs.build_only }}
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build Spring Boot application
+        run: |
+          echo "🏗️ Building Spring Boot microservice with Maven..."
+          mvn clean package -DskipTests
+          echo "✅ Spring Boot application built successfully"
+
+      - name: Build Docker image
+        id: build
+        run: |
+          echo "🐳 Building Docker image for backend microservice..."
+          docker build --tag cloudinsight-backend-microservice:${{ github.sha }} .
+          echo "✅ Docker image built successfully: cloudinsight-backend-microservice:${{ github.sha }}"
+
+      - name: Run Trivy vulnerability scanner on image
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: cloudinsight-backend-microservice:${{ github.sha }}
+          format: "sarif"
+          output: "trivy-image-results.sarif"
+          severity: ${{ inputs.trivy_severity }}
+
+      - name: Upload Trivy scan results
+        if: always()
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: "trivy-image-results.sarif"
+
+      - name: Check SARIF file (for debugging)
+        if: always()
+        run: |
+          if [ -f "trivy-image-results.sarif" ]; then
+            echo "✅ SARIF file exists:"
+            ls -la trivy-image-results.sarif
+            echo "📋 SARIF file size: $(stat -c%s trivy-image-results.sarif) bytes"
+            echo "🔍 First few lines of SARIF:"
+            head -20 trivy-image-results.sarif
+          else
+            echo "❌ SARIF file not found"
+          fi
+
+      # Versioning and Push steps (only run if not build_only mode)
+      - name: Analyze commit messages
+        if: ${{ !inputs.build_only && steps.build.outcome == 'success' }}
+        id: analyze-commits
+        run: |
+          echo "🔍 Analyzing commit messages for semantic versioning..."
+
+          # Get the latest tag
+          LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+
+          # Check if this is a merge commit from a PR
+          LATEST_COMMIT=$(git log -1 --oneline)
+          IS_PR_MERGE=false
+
+          if echo "$LATEST_COMMIT" | grep -q "Merge pull request"; then
+            IS_PR_MERGE=true
+            echo "🔍 Detected PR merge commit: $LATEST_COMMIT"
+            echo "📋 Analyzing ALL commits since last tag for semantic versioning:"
+          else
+            echo "🔍 Detected direct push"
+          fi
+
+          # Always analyze ALL commits since last tag (not just PR commits)
+          if [ -n "$LAST_TAG" ]; then
+            # Get all commits since last tag, excluding merge commits to avoid noise
+            COMMITS=$(git log ${LAST_TAG}..HEAD --pretty=format:"%s" --no-merges 2>/dev/null || echo "")
+            echo "📋 Analyzing commits since last tag ($LAST_TAG):"
+          else
+            # No tags exist, analyze recent non-merge commits
+            COMMITS=$(git log --pretty=format:"%s" --no-merges -10)
+            echo "📋 No tags found, analyzing recent non-merge commits:"
+          fi
+
+          # If we still have no commits, get the last non-merge commit
+          if [ -z "$COMMITS" ]; then
+            COMMITS=$(git log -1 --pretty=format:"%s" --no-merges)
+            echo "📋 Fallback: analyzing last non-merge commit"
+          fi
+
+          if [ -z "$COMMITS" ]; then
+            echo "❌ No commits found for analysis"
+            echo "suggested_bump=patch" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "📋 Found commits for semantic analysis:"
+          echo "$COMMITS" | while read commit; do echo "  - $commit"; done
+
+          # Debug: Count commits to ensure we're not analyzing too many
+          COMMIT_COUNT=$(echo "$COMMITS" | wc -l)
+          echo "📊 Total commits to analyze: $COMMIT_COUNT"
+
+          # Sanity check: If we have too many commits (>20), something might be wrong
+          if [ "$COMMIT_COUNT" -gt 20 ]; then
+            echo "⚠️ Warning: Analyzing $COMMIT_COUNT commits seems excessive"
+            echo "🔍 This might indicate an issue with commit range calculation"
+            
+            # Limit to last 10 commits to avoid analyzing too much history
+            COMMITS=$(echo "$COMMITS" | head -10)
+            echo "📋 Limited to last 10 commits for analysis"
+          fi
+
+          # Analyze commit messages for semantic versioning patterns
+          BREAKING_CHANGES=0
+          FEATURES=0
+          FIXES=0
+
+          while IFS= read -r commit; do
+            [ -z "$commit" ] && continue
+            
+            echo "🔍 Analyzing: $commit"
+            
+            # Check for breaking changes (BREAKING CHANGE: or type!: patterns only)
+            if echo "$commit" | grep -qiE "(BREAKING CHANGE:|^[^:]+!:|^[^(]+\([^)]*\)!:)"; then
+              echo "  💥 Breaking change detected"
+              BREAKING_CHANGES=$((BREAKING_CHANGES + 1))
+            # Check for features
+            elif echo "$commit" | grep -qE "^feat(\([^)]*\))?:"; then
+              echo "  ✨ Feature detected"
+              FEATURES=$((FEATURES + 1))
+            # Check for fixes
+            elif echo "$commit" | grep -qE "^fix(\([^)]*\))?:"; then
+              echo "  🐛 Fix detected"
+              FIXES=$((FIXES + 1))
+            # Check for other build-worthy changes
+            elif echo "$commit" | grep -qE "^(build|ci|perf|refactor)(\([^)]*\))?:"; then
+              echo "  🔧 Build/CI change detected"
+              FIXES=$((FIXES + 1))  # Treat as patch-level change
+            else
+              echo "  📝 Other commit (no version impact)"
+            fi
+          done <<< "$COMMITS"
+
+          # Determine version bump
+          if [ "$BREAKING_CHANGES" -gt 0 ]; then
+            SUGGESTED_BUMP="major"
+            echo "🚀 Suggested bump: MAJOR (breaking changes: $BREAKING_CHANGES)"
+          elif [ "$FEATURES" -gt 0 ]; then
+            SUGGESTED_BUMP="minor"
+            echo "🚀 Suggested bump: MINOR (features: $FEATURES)"
+          elif [ "$FIXES" -gt 0 ]; then
+            SUGGESTED_BUMP="patch"
+            echo "🚀 Suggested bump: PATCH (fixes/improvements: $FIXES)"
+          else
+            SUGGESTED_BUMP="patch"
+            echo "🚀 Suggested bump: PATCH (default - no semantic commits found)"
+          fi
+
+          echo "suggested_bump=$SUGGESTED_BUMP" >> $GITHUB_OUTPUT
+
+      - name: Calculate version
+        if: ${{ !inputs.build_only && steps.build.outcome == 'success' }}
+        id: version
+        run: |
+          # Handle branch-specific versioning strategies
+          if [ "${{ github.ref_name }}" == "staging" ]; then
+            # Staging: Extract latest tag from merged PR commits
+            echo "🔄 Staging branch detected - extracting latest tag from merged PR"
+            
+            # Find the merge commit (should be the HEAD)
+            MERGE_COMMIT=$(git rev-parse HEAD)
+            echo "📋 Merge commit: $MERGE_COMMIT"
+            
+            # Get the PR commits (commits from the feature branch that was merged)
+            # Get the two parents of the merge commit
+            FIRST_PARENT=$(git rev-parse HEAD^1)   # Development/staging branch
+            SECOND_PARENT=$(git rev-parse HEAD^2)  # Feature branch
+            
+            # Get commits from the feature branch (second parent to merge base)
+            MERGE_BASE=$(git merge-base $FIRST_PARENT $SECOND_PARENT)
+            PR_COMMITS=$(git log --format="%H" $MERGE_BASE..$SECOND_PARENT)
+            
+            if [ -z "$PR_COMMITS" ]; then
+              echo "⚠️ No PR commits found, using current HEAD"
+              PR_COMMITS="$MERGE_COMMIT"
+            fi
+            
+            echo "📋 PR commits to check for tags:"
+            echo "$PR_COMMITS"
+            
+            # Find tags attached to any of the PR commits
+            LATEST_TAG=""
+            LATEST_TAG_COMMIT=""
+            
+            for commit in $PR_COMMITS; do
+              # Check if this commit has any tags
+              COMMIT_TAGS=$(git tag --points-at $commit)
+              if [ -n "$COMMIT_TAGS" ]; then
+                echo "📋 Found tags on commit $commit: $COMMIT_TAGS"
+                for tag in $COMMIT_TAGS; do
+                  if [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                    echo "📋 Valid version tag found: $tag"
+                    if [ -z "$LATEST_TAG" ] || [ "$(printf '%s\n%s\n' "$LATEST_TAG" "$tag" | sort -V | tail -n1)" = "$tag" ]; then
+                      LATEST_TAG="$tag"
+                      LATEST_TAG_COMMIT="$commit"
+                    fi
+                  fi
+                done
+              fi
+            done
+            
+            if [ -n "$LATEST_TAG" ]; then
+              # Use the latest tag found in PR commits and add -rc suffix
+              BASE_VERSION=$(echo "$LATEST_TAG" | sed 's/^v//')
+              NEW_VERSION="$BASE_VERSION-rc"
+              NEW_TAG="v$NEW_VERSION"
+              echo "✅ Using tag $LATEST_TAG from PR commit $LATEST_TAG_COMMIT"
+              echo "✅ Creating RC version: $NEW_TAG"
+            else
+              echo "❌ No version tags found in merged PR commits"
+              echo "💡 Please ensure the PR includes commits with proper version tags"
+              exit 1
+            fi
+            
+          elif [ "${{ github.ref_name }}" == "production" ]; then
+            # Production: Extract latest tag from merged PR commits (should be RC tag)
+            echo "🚀 Production branch detected - extracting latest RC tag from merged PR"
+            
+            # Find the merge commit (should be the HEAD)
+            MERGE_COMMIT=$(git rev-parse HEAD)
+            echo "📋 Merge commit: $MERGE_COMMIT"
+            
+            # Get the PR commits (commits from the staging branch that was merged)
+            FIRST_PARENT=$(git rev-parse HEAD^1)   # Production branch
+            SECOND_PARENT=$(git rev-parse HEAD^2)  # Staging branch
+            
+            # Get commits from the staging branch
+            MERGE_BASE=$(git merge-base $FIRST_PARENT $SECOND_PARENT)
+            PR_COMMITS=$(git log --format="%H" $MERGE_BASE..$SECOND_PARENT)
+            
+            if [ -z "$PR_COMMITS" ]; then
+              echo "⚠️ No PR commits found, using current HEAD"
+              PR_COMMITS="$MERGE_COMMIT"
+            fi
+            
+            echo "📋 PR commits to check for RC tags:"
+            echo "$PR_COMMITS"
+            
+            # Find RC tags attached to any of the PR commits
+            LATEST_RC_TAG=""
+            LATEST_RC_TAG_COMMIT=""
+            
+            for commit in $PR_COMMITS; do
+              COMMIT_TAGS=$(git tag --points-at $commit)
+              if [ -n "$COMMIT_TAGS" ]; then
+                echo "� Found tags on commit $commit: $COMMIT_TAGS"
+                for tag in $COMMIT_TAGS; do
+                  if [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-rc$ ]]; then
+                    echo "📋 Valid RC tag found: $tag"
+                    if [ -z "$LATEST_RC_TAG" ] || [ "$(printf '%s\n%s\n' "$LATEST_RC_TAG" "$tag" | sort -V | tail -n1)" = "$tag" ]; then
+                      LATEST_RC_TAG="$tag"
+                      LATEST_RC_TAG_COMMIT="$commit"
+                    fi
+                  fi
+                done
+              fi
+            done
+            
+            if [ -n "$LATEST_RC_TAG" ]; then
+              # Promote RC tag to production (remove -rc suffix)
+              RC_VERSION=$(echo "$LATEST_RC_TAG" | sed 's/^v//' | sed 's/-rc$//')
+              
+              echo "📋 Found RC tag: $LATEST_RC_TAG"
+              echo "🔍 Analyzing merge commit for breaking changes..."
+              
+              # Analyze ONLY the merge commit message for breaking changes
+              MERGE_COMMIT_MSG=$(git log --format=%s -n 1 $MERGE_COMMIT 2>/dev/null || echo "")
+              echo "� Merge commit message: $MERGE_COMMIT_MSG"
+              
+              # Check if merge commit has breaking changes
+              if echo "$MERGE_COMMIT_MSG" | grep -qiE "(BREAKING CHANGE:|^[^:]+!:|^[^(]+\([^)]*\)!:)"; then
+                # Breaking change detected - increment major version
+                IFS='.' read -ra RC_PARTS <<< "$RC_VERSION"
+                RC_MAJOR=${RC_PARTS[0]:-0}
+                RC_MINOR=${RC_PARTS[1]:-0}
+                RC_PATCH=${RC_PARTS[2]:-0}
+                
+                # Increment major version
+                NEW_MAJOR=$((RC_MAJOR + 1))
+                NEW_VERSION="$NEW_MAJOR.0.0"
+                NEW_TAG="v$NEW_VERSION"
+                
+                echo "🚀 BREAKING CHANGE DETECTED in merge commit!"
+                echo "� Breaking change: $MERGE_COMMIT_MSG"
+                echo "✅ Bumping from $LATEST_RC_TAG to $NEW_TAG (major version increment)"
+                echo "💡 Production deployment will proceed with $NEW_TAG"
+              else
+                # No breaking changes - just remove RC suffix
+                NEW_VERSION="$RC_VERSION"
+                NEW_TAG="v$NEW_VERSION"
+                echo "✅ No breaking changes detected in merge commit"
+                echo "✅ Promoting RC tag $LATEST_RC_TAG to production version: $NEW_TAG"
+              fi
+            else
+              echo "❌ No RC tags found in merged PR commits"
+              echo "💡 Please ensure the PR from staging includes RC tags"
+              exit 1
+            fi
+            
+          else
+            # Development branches: Calculate new versions based on commit analysis
+            echo "📊 Development branch detected - calculating new version based on commits"
+            
+            # Get the latest tag from git
+            LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+
+            if [ -n "$LATEST_TAG" ]; then
+              CURRENT_VERSION=$(echo "$LATEST_TAG" | sed 's/^v//')
+              echo "📋 Latest git tag: $LATEST_TAG (version: $CURRENT_VERSION)"
+            else
+              # No tags exist, start with default version
+              CURRENT_VERSION="0.0.0"
+              echo "📋 No git tags found, starting with default version: $CURRENT_VERSION"
+            fi
+            
+            # Parse version components
+            IFS='.' read -ra VERSION_PARTS <<< "$CURRENT_VERSION"
+            MAJOR=${VERSION_PARTS[0]:-0}
+            MINOR=${VERSION_PARTS[1]:-0}
+            PATCH=${VERSION_PARTS[2]:-0}
+
+            BUMP_TYPE="${{ steps.analyze-commits.outputs.suggested_bump }}"
+            echo "📋 Suggested bump type: $BUMP_TYPE"
+
+            # Calculate new version
+            case "$BUMP_TYPE" in
+              major)
+                MAJOR=$((MAJOR + 1))
+                MINOR=0
+                PATCH=0
+                ;;
+              minor)
+                MINOR=$((MINOR + 1))
+                PATCH=0
+                ;;
+              patch)
+                PATCH=$((PATCH + 1))
+                ;;
+            esac
+
+            NEW_VERSION="$MAJOR.$MINOR.$PATCH"
+            NEW_TAG="v$NEW_VERSION"
+
+            # Check if the calculated tag already exists
+            if git rev-parse "$NEW_TAG" >/dev/null 2>&1; then
+              echo "⚠️ Tag $NEW_TAG already exists, force bumping patch version"
+              PATCH=$((PATCH + 1))
+              NEW_VERSION="$MAJOR.$MINOR.$PATCH"
+              NEW_TAG="v$NEW_VERSION"
+            fi
+          fi
+
+          echo "🏷️ Calculated new version: $NEW_VERSION"
+          echo "🏷️ New tag will be: $NEW_TAG"
+          echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Tag and push image to ECR
+        if: ${{ !inputs.build_only && steps.build.outcome == 'success' }}
+        id: push
+        run: |
+          ECR_REGISTRY=${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY="${{ secrets.ECR_REPOSITORY_NAME }}"
+          VERSION_TAG="v${{ steps.version.outputs.new_version }}"
+          COMMIT_TAG=${{ github.sha }}
+
+          echo "🔍 Checking if ECR repository exists..."
+          aws ecr describe-repositories --repository-names $ECR_REPOSITORY 2>/dev/null || \
+          aws ecr create-repository --repository-name $ECR_REPOSITORY
+
+          echo "🏷️ Tagging image for ECR push..."
+          docker tag cloudinsight-backend-microservice:$COMMIT_TAG $ECR_REGISTRY/$ECR_REPOSITORY:$VERSION_TAG
+          docker tag cloudinsight-backend-microservice:$COMMIT_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+          echo "📤 Pushing image to ECR..."
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$VERSION_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+          IMAGE_URI="$ECR_REGISTRY/$ECR_REPOSITORY:$VERSION_TAG"
+          echo "✅ Successfully pushed image to ECR: $IMAGE_URI"
+          echo "image_uri=$IMAGE_URI" >> $GITHUB_OUTPUT
+
+      - name: Create git tag (only after successful ECR push)
+        if: ${{ !inputs.build_only && steps.push.outcome == 'success' }}
+        run: |
+          TAG_NAME="v${{ steps.version.outputs.new_version }}"
+          echo "🏷️ Creating git tag: $TAG_NAME"
+
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+
+          # Check if tag already exists
+          if git rev-parse "$TAG_NAME" >/dev/null 2>&1; then
+            echo "⚠️ Tag $TAG_NAME already exists"
+            echo "🔍 Checking if it points to the current commit..."
+            
+            EXISTING_TAG_COMMIT=$(git rev-list -n 1 "$TAG_NAME")
+            CURRENT_COMMIT=$(git rev-parse HEAD)
+            
+            if [ "$EXISTING_TAG_COMMIT" = "$CURRENT_COMMIT" ]; then
+              echo "✅ Tag $TAG_NAME already points to current commit - no action needed"
+            else
+              echo "⚠️ Tag $TAG_NAME points to different commit, skipping tag creation"
+              echo "📋 Existing tag commit: $EXISTING_TAG_COMMIT"
+              echo "📋 Current commit: $CURRENT_COMMIT"
+              echo "💡 Tag creation skipped to avoid conflicts"
+            fi
+          else
+            # Create new tag
+            git tag -a "$TAG_NAME" -m "Release $TAG_NAME"
+            git push origin "$TAG_NAME"
+            echo "✅ Successfully created and pushed git tag: $TAG_NAME"
+          fi
+
+      - name: Create GitHub Release
+        if: ${{ !inputs.build_only && steps.push.outcome == 'success' && github.ref_name == 'production' }}
+        run: |
+          TAG_NAME="v${{ steps.version.outputs.new_version }}"
+          RELEASE_NAME="Release v${{ steps.version.outputs.new_version }}"
+
+          echo "� Creating GitHub release for production deployment..."
+          echo "�🔍 Checking if release $TAG_NAME already exists..."
+
+          # Create release using GitHub API - fail if already exists
+          RELEASE_BODY="CloudInsight Frontend Release v${{ steps.version.outputs.new_version }}
+
+          🐳 **Container Image:** ${{ steps.push.outputs.image_uri }}
+          📝 **Commit:** ${{ github.sha }}
+          🔄 **Bump Type:** ${{ steps.analyze-commits.outputs.suggested_bump }}
+
+          ## Production Deployment
+          This release represents a stable production deployment of the CloudInsight Frontend application."
+
+          RELEASE_RESPONSE=$(curl -s \
+            -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${{ github.repository }}/releases" \
+            -d @- <<EOF
+          {
+            "tag_name": "$TAG_NAME",
+            "name": "$RELEASE_NAME",
+            "body": $(echo "$RELEASE_BODY" | jq -Rs .),
+            "draft": false,
+            "prerelease": false
+          }
+          EOF
+          )
+
+          if echo "$RELEASE_RESPONSE" | jq -e '.id' > /dev/null; then
+            echo "✅ Successfully created GitHub release: $TAG_NAME"
+            RELEASE_URL=$(echo "$RELEASE_RESPONSE" | jq -r '.html_url')
+            echo "🔗 Release URL: $RELEASE_URL"
+          else
+            echo "❌ Failed to create GitHub release"
+            echo "📋 Response: $RELEASE_RESPONSE"
+            
+            # Check if it's because release already exists
+            if echo "$RELEASE_RESPONSE" | jq -e '.errors[]? | select(.code == "already_exists")' > /dev/null; then
+              echo "💥 ERROR: Release $TAG_NAME already exists!"
+              echo "� Production releases must be unique"
+              exit 1
+            else
+              echo "💥 ERROR: Unexpected API error"
+              exit 1
+            fi
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and deployment summary
+        if: always()
+        run: |
+          echo "## 🐳 Build & Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Project Type:** ${{ inputs.project_type }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image Tag:** cloudinsight-backend-microservice:${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Build Only:** ${{ inputs.build_only }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Push Secrets:** ${{ inputs.push_secrets }}" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ steps.build.outcome }}" == "success" ]; then
+            echo "- **Build Status:** ✅ Build successful" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- **Build Status:** ❌ Build failed" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ "${{ inputs.build_only }}" == "false" ]; then
+            if [ "${{ steps.build.outcome }}" == "success" ]; then
+              echo "- **Version:** ${{ steps.version.outputs.new_version }}" >> $GITHUB_STEP_SUMMARY
+              
+              if [ "${{ steps.push.outcome }}" == "success" ]; then
+                echo "- **ECR Push:** ✅ Pushed to ECR" >> $GITHUB_STEP_SUMMARY
+                echo "- **Image URI:** ${{ steps.push.outputs.image_uri }}" >> $GITHUB_STEP_SUMMARY
+                echo "- **Git Tag:** ✅ Created v${{ steps.version.outputs.new_version }}" >> $GITHUB_STEP_SUMMARY
+                echo "- **GitHub Release:** ✅ Created" >> $GITHUB_STEP_SUMMARY
+              else
+                echo "- **ECR Push:** ❌ Failed" >> $GITHUB_STEP_SUMMARY
+                echo "- **Git Tag:** ⏭️ Skipped (ECR push failed)" >> $GITHUB_STEP_SUMMARY
+                echo "- **GitHub Release:** ⏭️ Skipped (ECR push failed)" >> $GITHUB_STEP_SUMMARY
+              fi
+            else
+              echo "- **Version:** ⏭️ Skipped (build failed)" >> $GITHUB_STEP_SUMMARY
+              echo "- **ECR Push:** ⏭️ Skipped (build failed)" >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "- **Version:** ⏭️ Skipped (build only mode)" >> $GITHUB_STEP_SUMMARY
+            echo "- **ECR Push:** ⏭️ Skipped (build only mode)" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Security cleanup
+        if: always()
+        run: |
+          echo "🧹 Performing security cleanup..."
+          rm -f ./team-private-key.pem ./temp-aes-key ./.env ./next-public-build-args.txt
+          echo "✅ Security cleanup completed"
+
+  build-summary:
+    name: Build Summary
+    runs-on: ubuntu-latest
+    needs: [check-build-needed, build-version-push]
+    if: always()
+    steps:
+      - name: Generate build summary
+        run: |
+          echo "## 🏗️ Build Workflow Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          BUILD_NEEDED="${{ needs.check-build-needed.outputs.build_needed }}"
+          SKIP_REASON="${{ needs.check-build-needed.outputs.skip_reason }}"
+          BUILD_RESULT="${{ needs.build-version-push.result }}"
+
+          if [ "$BUILD_NEEDED" == "true" ]; then
+            echo "✅ **Build Required**: Yes" >> $GITHUB_STEP_SUMMARY
+            echo "🎯 **Reason**: Changes detected that require container rebuild" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            
+            if [ "$BUILD_RESULT" == "success" ]; then
+              echo "🚀 **Build Result**: ✅ Successfully completed" >> $GITHUB_STEP_SUMMARY
+              if [ "${{ needs.build-version-push.outputs.version }}" != "" ]; then
+                echo "🏷️ **Version**: ${{ needs.build-version-push.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+              fi
+              if [ "${{ needs.build-version-push.outputs.image_uri }}" != "" ]; then
+                echo "📦 **Image**: ${{ needs.build-version-push.outputs.image_uri }}" >> $GITHUB_STEP_SUMMARY
+              fi
+            elif [ "$BUILD_RESULT" == "failure" ]; then
+              echo "🚀 **Build Result**: ❌ Failed" >> $GITHUB_STEP_SUMMARY
+            elif [ "$BUILD_RESULT" == "cancelled" ]; then
+              echo "🚀 **Build Result**: ⏹️ Cancelled" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "🚀 **Build Result**: ⏭️ Skipped" >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "⏭️ **Build Required**: No" >> $GITHUB_STEP_SUMMARY
+            echo "📝 **Reason**: $SKIP_REASON" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "💡 **What triggers a build?**" >> $GITHUB_STEP_SUMMARY
+            echo "- Push to development/staging/production branches" >> $GITHUB_STEP_SUMMARY
+            echo "- Commit messages with: feat:, fix:, BREAKING CHANGE, build:, ci:" >> $GITHUB_STEP_SUMMARY
+            echo "- NOT manual triggers or pull requests" >> $GITHUB_STEP_SUMMARY
+          fi
