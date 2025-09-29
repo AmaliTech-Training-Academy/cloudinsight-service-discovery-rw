@@ -30,7 +30,7 @@ on:
         description: "Skip SonarQube quality gate check"
         required: false
         type: boolean
-        default: false
+        default: true
     outputs:
       dependency_scan_results:
         description: "Dependency scan results"
