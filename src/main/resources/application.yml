@@ -14,22 +14,22 @@ eureka:
     fetchRegistry: ${EUREKA_CLIENT_FETCH_REGISTRY}
     serviceUrl:
       defaultZone: ${EUREKA_CLIENT_SERVICEURL_DEFAULTZONE}
-    # Industry standard: Fetch registry every 30 seconds
-    registry-fetch-interval-seconds: 30
+    # Balanced: Fetch registry every 15 seconds for faster discovery
+    registry-fetch-interval-seconds: 15
   instance:
     prefer-ip-address: true
-    # Industry standard: Send heartbeat every 30 seconds
-    lease-renewal-interval-in-seconds: 30
-    # Industry standard: Expire instance after 90 seconds without heartbeat
-    lease-expiration-duration-in-seconds: 90
+    # Balanced: Send heartbeat every 15 seconds (faster than standard)
+    lease-renewal-interval-in-seconds: ${EUREKA_INSTANCE_LEASE_RENEWAL_INTERVAL_IN_SECONDS:15}
+    # Balanced: Expire instance after 45 seconds (3x heartbeat interval)
+    lease-expiration-duration-in-seconds: ${EUREKA_INSTANCE_LEASE_EXPIRATION_DURATION_IN_SECONDS:45}
   server:
-    # Keep self-preservation disabled to prevent emergency mode
-    enable-self-preservation: false
-    # Industry standard: Run eviction task every 60 seconds
-    eviction-interval-timer-in-ms: 60000
-    # Industry standard: 85% renewal threshold
-    renewal-percent-threshold: 0.85
-    # Industry standard: Update response cache every 30 seconds
-    response-cache-update-interval-ms: 30000
-    # Industry standard: Cache expires after 10 minutes
-    response-cache-auto-expiration-in-seconds: 600
+    # Re-enable self-preservation with tuned threshold
+    enable-self-preservation: ${EUREKA_SERVER_ENABLE_SELF_PRESERVATION:true}
+    # More frequent eviction but not too aggressive
+    eviction-interval-timer-in-ms: ${EUREKA_SERVER_EVICTION_INTERVAL_TIMER_IN_MS:10000}
+    # Lower threshold to prevent emergency mode (49% instead of 85%)
+    renewal-percent-threshold: ${EUREKA_SERVER_RENEWAL_PERCENT_THRESHOLD:0.49}
+    # Faster response cache update for quicker discovery
+    response-cache-update-interval-ms: 15000
+    # Shorter cache expiration for fresher data
+    response-cache-auto-expiration-in-seconds: 300
