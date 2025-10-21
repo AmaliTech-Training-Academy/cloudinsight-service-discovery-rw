@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Production-ready entrypoint script for service-discovery
+# Production-ready entrypoint script for service-discovery.
 ENV_JSON_FILE="/mnt/secrets/service-discovery-env.json"
 
 # List of environment variables to ignore (already hardcoded in deployment)
